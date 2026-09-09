@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "patrick.radio-lab",
+  "name": "Radio Lab",
+  "version": "1.0.0",
+  "author": "patrick",
+  "license": "MIT",
+  "description": "Manage multiple Wi-Fi NICs: park a lab radio, scan bands, and capture in parallel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Radio Lab",
+    "description": "Multi-WNIC monitor, channel assignment, scan, and packet capture",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 2
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 1,
+        "max": 15,
+        "step": 1,
+        "defaultValue": 2
+      }
+    ]
+  }
+}

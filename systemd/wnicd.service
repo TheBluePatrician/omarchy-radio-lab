@@ -1,0 +1,16 @@
+# Example unit. bin/install.sh writes the live copy to
+# /etc/systemd/system/wnicd.service with the installing user's uid and
+# capture directory. Do not copy this file as-is onto another machine.
+[Unit]
+Description=Radio Lab multi-WNIC monitor and capture helper
+After=network-pre.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/radio-lab/wnicd daemon --foreground --allow-uid 1000 --capture-dir /home/patrick/radio-lab/captures
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,3143 @@
+#!/usr/bin/env python3
+"""Radio Lab — multi-WNIC inventory, monitor mode, channel parking, scan, and pcap.
+
+This file is both the privileged daemon (`wnicd`) and the user-facing CLI
+(`wnic-ctl`). Status collection is unprivileged. Monitor/channel/scan/capture
+mutations talk to the daemon over a unix socket. The daemon is the only
+process that needs CAP_NET_ADMIN / CAP_NET_RAW.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from collections import OrderedDict
+from datetime import datetime, timezone
+from pathlib import Path
+
+PLUGIN_ID = "patrick.radio-lab"
+RLAB_PREFIX = "rlab"
+DEFAULT_SOCKET = "/run/wnicd/control.sock"
+DEFAULT_STATUS = "/run/wnicd/status.json"
+DEFAULT_DIR = "/run/wnicd"
+SNAPLEN = 65535
+DLT_EN10MB = 1
+DLT_IEEE802_11 = 105
+DLT_PRISM_HEADER = 119
+DLT_IEEE802_11_RADIO = 127
+ARPHRD_ETHER = 1
+ARPHRD_IEEE80211 = 801
+ARPHRD_IEEE80211_PRISM = 802
+ARPHRD_IEEE80211_RADIOTAP = 803
+ARPHRD_TO_DLT = {
+    ARPHRD_ETHER: DLT_EN10MB,
+    ARPHRD_IEEE80211: DLT_IEEE802_11,
+    ARPHRD_IEEE80211_PRISM: DLT_PRISM_HEADER,
+    ARPHRD_IEEE80211_RADIOTAP: DLT_IEEE802_11_RADIO,
+}
+MAX_AIR = 400
+MAX_CLIENTS = 300
+
+# 80 MHz center channel for a primary 20 MHz channel (IEEE 802.11ac layout).
+VHT80_CENTER = {
+    36: 42, 40: 42, 44: 42, 48: 42,
+    52: 58, 56: 58, 60: 58, 64: 58,
+    100: 106, 104: 106, 108: 106, 112: 106,
+    116: 122, 120: 122, 124: 122, 128: 122,
+    132: 138, 136: 138, 140: 138, 144: 138,
+    149: 155, 153: 155, 157: 155, 161: 155,
+}
+
+# 160 MHz center channel for a primary 20 MHz channel (IEEE 802.11ac/ax).
+VHT160_CENTER = {
+    36: 50, 40: 50, 44: 50, 48: 50, 52: 50, 56: 50, 60: 50, 64: 50,
+    100: 114, 104: 114, 108: 114, 112: 114, 116: 114, 120: 114, 124: 114, 128: 114,
+    149: 163, 153: 163, 157: 163, 161: 163, 165: 163, 169: 163, 173: 163, 177: 163,
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def run(args: list[str], timeout: float = 20.0) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", f"missing {args[0]}"
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def mac_colon(raw: bytes | str) -> str:
+    if isinstance(raw, bytes):
+        return ":".join(f"{b:02x}" for b in raw)
+    value = str(raw).strip().lower().replace("-", ":")
+    return value
+
+
+def read_text(path: Path, default: str = "") -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return default
+
+
+def iface_arphrd(iface: str) -> int:
+    text = read_text(Path(f"/sys/class/net/{iface}/type"), "0")
+    try:
+        return int(text.split()[0])
+    except ValueError:
+        return 0
+
+
+def iface_pcap_dlt(iface: str) -> int:
+    return ARPHRD_TO_DLT.get(iface_arphrd(iface), DLT_IEEE802_11_RADIO)
+
+
+def mac_bytes(mac: str) -> bytes:
+    parts = mac_colon(mac).split(":")
+    if len(parts) != 6:
+        return b"\x00" * 6
+    try:
+        return bytes(int(part, 16) for part in parts)
+    except ValueError:
+        return b"\x00" * 6
+
+
+def radiotap_header(freq: int, rssi: int | None, band: str = "") -> bytes:
+    """Minimal radiotap: flags, rate, channel, dBm antsignal."""
+    present = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5)
+    flags = 0
+    mhz = int(freq or 0)
+    use_band = band or band_of_freq(mhz)
+    if use_band in ("5", "6") or mhz >= 5000:
+        rate = 12  # 6 Mbps
+        chan_flags = 0x0140  # 5 GHz OFDM
+    else:
+        rate = 2  # 1 Mbps
+        chan_flags = 0x00A0  # 2 GHz CCK
+    signal = int(rssi if rssi is not None else -100)
+    signal = max(-128, min(127, signal))
+    payload = bytes([flags, rate]) + struct.pack("<HH", mhz, chan_flags) + struct.pack("b", signal)
+    return struct.pack("<BBHI", 0, 0, 8 + len(payload), present) + payload
+
+
+def build_survey_frame(ap: dict, seq: int) -> bytes:
+    """Rebuild a beacon + radiotap from an `iw scan dump` BSS so Wireshark can open the survey."""
+    bssid = mac_bytes(str(ap.get("bssid") or ""))
+    ssid = str(ap.get("ssid") or "").encode("utf-8", "replace")[:32]
+    freq = int(float(ap.get("freq") or 0))
+    channel = int(ap.get("channel") or 0) or (channel_of_freq(freq) or 0)
+    rssi = ap.get("rssi")
+    if rssi is not None:
+        try:
+            rssi = int(round(float(rssi)))
+        except (TypeError, ValueError):
+            rssi = None
+    band = str(ap.get("band") or band_of_freq(freq) or "")
+    header = radiotap_header(freq, rssi, band)
+    frame_control = 0x0080  # management / beacon
+    seq_ctrl = (int(seq) & 0x0FFF) << 4
+    mac = struct.pack("<HH", frame_control, 0) + (b"\xff" * 6) + bssid + bssid + struct.pack("<H", seq_ctrl)
+    cap = 0x0001  # ESS
+    if "WPA" in str(ap.get("security") or "") or "RSN" in str(ap.get("security") or ""):
+        cap |= 0x0010  # Privacy
+    body = struct.pack("<QHH", int(time.time() * 1_000_000) & ((1 << 64) - 1), 100, cap)
+    body += bytes([0, len(ssid)]) + ssid
+    if 1 <= channel <= 14:
+        body += bytes([3, 1, channel])
+    body += bytes([1, 4, 0x82, 0x84, 0x8B, 0x96])
+    return header + mac + body
+
+
+def read_link(path: Path) -> str:
+    try:
+        return os.path.basename(os.path.realpath(path))
+    except OSError:
+        return ""
+
+
+def sysfs_uevent(device: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    text = read_text(device / "uevent")
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            data[key] = value
+    return data
+
+
+def is_lab_radio(sysfs: dict) -> bool:
+    driver = str(sysfs.get("driver") or "").lower()
+    if sysfs.get("bus") == "usb":
+        return True
+    return driver.startswith("mt7921") or driver.startswith("mt792x")
+
+
+def is_uplink_radio(sysfs: dict) -> bool:
+    if is_lab_radio(sysfs):
+        return False
+    return sysfs.get("bus") == "pci"
+
+
+def default_route_iface() -> str:
+    code, out, _ = run(["ip", "-4", "route", "show", "default"], timeout=3)
+    if code != 0:
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return ""
+
+
+def radio_is_uplink(sysfs: dict, station_iface: str, route_iface: str) -> bool:
+    if station_iface and station_iface == route_iface:
+        return True
+    if route_iface:
+        return False
+    return is_uplink_radio(sysfs)
+
+
+def supports_passive_monitor(sysfs: dict, info: dict) -> bool:
+    """RTL8821CE advertises monitor but cannot park a channel independently
+    of the station vif (EBUSY). Off-channel *active* scans still work."""
+    driver = str(sysfs.get("driver") or "").lower()
+    if driver.startswith("rtw88") or driver.startswith("rtl8"):
+        return False
+    if info.get("no_combinations"):
+        return False
+    modes = info.get("modes") or []
+    return "monitor" in modes or bool(info.get("software_monitor"))
+
+
+def bus_for(device: Path) -> str:
+    try:
+        resolved = str(device.resolve())
+    except OSError:
+        resolved = str(device)
+    if "/usb" in resolved:
+        return "usb"
+    if "/pci" in resolved:
+        return "pci"
+    if "/sdio" in resolved:
+        return "sdio"
+    if "/virtio" in resolved:
+        return "virtio"
+    return "unknown"
+
+
+CHIPSETS = {
+    "10EC:C821": "RTL8821CE",
+    "10EC:C82F": "RTL8822CE",
+    "10EC:B822": "RTL8822BE",
+    "10EC:8852": "RTL8852AE",
+    "8086:2723": "Intel AX200",
+    "8086:51F0": "Intel AX211",
+    "8086:7E40": "Intel BE201",
+    "14E4:43A0": "Broadcom BCM4360",
+    "0BDA:8812": "RTL8812AU",
+    "0BDA:881A": "RTL8812AU",
+    "0BDA:8813": "RTL8814AU",
+    "0BDA:826D": "RTL8821CU",
+    "0E8D:7612": "MT7612U",
+    "0E8D:7961": "MT7921U",
+    "0CF3:9271": "Atheros AR9271",
+    "148F:3070": "Ralink RT3070",
+    "148F:5572": "Ralink RT5572",
+}
+
+
+def product_for(device: Path, uevent: dict[str, str]) -> str:
+    for name in ("product", "model", "manufacturer"):
+        value = read_text(device / name)
+        if value:
+            return value
+    if uevent.get("ID_MODEL_FROM_DATABASE"):
+        return uevent["ID_MODEL_FROM_DATABASE"]
+    pci_id = (uevent.get("PCI_ID") or "").upper()
+    if pci_id in CHIPSETS:
+        return CHIPSETS[pci_id]
+    product = (uevent.get("PRODUCT") or "").split("/")
+    if len(product) >= 2:
+        try:
+            usb_id = f"{int(product[0], 16):04X}:{int(product[1], 16):04X}"
+        except ValueError:
+            usb_id = ""
+        if usb_id in CHIPSETS:
+            return CHIPSETS[usb_id]
+        if usb_id:
+            return f"USB {usb_id}"
+    if pci_id:
+        return f"PCI {pci_id}"
+    return ""
+
+
+def band_of_freq(mhz: float | int | None) -> str:
+    if not mhz:
+        return ""
+    freq = float(mhz)
+    if 2400 <= freq < 2500:
+        return "2.4"
+    if 4900 <= freq < 5925:
+        return "5"
+    if 5925 <= freq < 7125:
+        return "6"
+    if 57000 <= freq < 71000:
+        return "60"
+    return ""
+
+
+def channel_of_freq(mhz: float | int | None) -> int:
+    if not mhz:
+        return 0
+    freq = float(mhz)
+    if abs(freq - 2484) < 0.5:
+        return 14
+    if 2400 <= freq < 2500:
+        return int(round((freq - 2407) / 5))
+    if 4900 <= freq < 5925:
+        return int(round((freq - 5000) / 5))
+    if 5925 <= freq < 7125:
+        return int(round((freq - 5950) / 5))
+    return 0
+
+
+def freq_of_channel(channel: int, band: str = "") -> int | None:
+    if band == "6" or (band in ("", "auto") and channel > 196):
+        return 5950 + 5 * channel
+    if band == "5" or (band in ("", "auto") and 32 <= channel <= 196):
+        return 5000 + channel * 5
+    if 1 <= channel <= 13 and band in ("", "auto", "2.4"):
+        return 2407 + channel * 5
+    if channel == 14 and band in ("", "auto", "2.4"):
+        return 2484
+    if band == "6":
+        return 5950 + 5 * channel
+    return None
+
+
+def infer_band(channel: int, band: str = "", mhz: float | int | None = None) -> str:
+    if mhz:
+        guessed = band_of_freq(mhz)
+        if guessed:
+            return guessed
+    if band and band != "auto":
+        return str(band)
+    if 32 <= channel <= 196:
+        return "5"
+    if channel > 196:
+        return "6"
+    return "2.4"
+
+
+def he_center_6(channel: int, width: int) -> int | None:
+    """6 GHz center frequency (MHz) for a primary 20 MHz channel at `width`."""
+    if channel < 1 or channel > 233:
+        return None
+    if width < 40:
+        return 5950 + 5 * channel
+    if width >= 320:
+        span, used = 64, 320
+    elif width >= 160:
+        span, used = 32, 160
+    elif width >= 80:
+        span, used = 16, 80
+    else:
+        span, used = 8, 40
+    center_ch = ((channel - 1) // span) * span + (span // 2 - 1)
+    if center_ch < 1 or center_ch > 233:
+        return None
+    freq = 5950 + 5 * center_ch
+    half = used / 2.0
+    if freq - half < 5925 or freq + half > 7125:
+        return None
+    return freq
+
+
+def nl_width_token(width: int) -> str:
+    if width >= 320:
+        return "320"
+    if width >= 160:
+        return "160"
+    if width >= 80:
+        return "80"
+    if width >= 40:
+        return "40"
+    if width == 10:
+        return "10"
+    if width == 5:
+        return "5"
+    return "20"
+
+
+def width_ladder(width: int, band: str) -> list[int]:
+    wanted = int(width or 20)
+    if band == "6":
+        steps = [320, 160, 80, 40, 20]
+    elif band == "5":
+        steps = [160, 80, 40, 20]
+    else:
+        steps = [40, 20]
+    ladder = [step for step in steps if step <= wanted]
+    return ladder or [20]
+
+
+def ht_flag(width: int, channel: int) -> str:
+    if width >= 320:
+        return "320MHz"
+    if width >= 160:
+        return "160MHz"
+    if width >= 80:
+        return "80MHz"
+    if width >= 40:
+        # HT40+ when the extra 20 MHz sits above the primary.
+        if 1 <= channel <= 7 or channel in (36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157):
+            return "HT40+"
+        return "HT40-"
+    if width == 10:
+        return "10MHz"
+    if width == 5:
+        return "5MHz"
+    return "HT20"
+
+
+def tune_commands(iface: str, channel: int, width: int, band: str, freq: int) -> list[tuple[list[str], int]]:
+    attempts: list[tuple[list[str], int]] = []
+    if band == "2.4":
+        if width >= 40:
+            attempts.append((["iw", "dev", iface, "set", "channel", str(channel), ht_flag(40, channel)], 40))
+        # NOHT first: HT20-only tune on mt7921u leaves 2.4 GHz monitor deaf.
+        attempts.append((["iw", "dev", iface, "set", "channel", str(channel), "NOHT"], 20))
+        attempts.append((["iw", "dev", iface, "set", "freq", str(freq)], 20))
+        attempts.append((["iw", "dev", iface, "set", "channel", str(channel), "HT20"], 20))
+        return attempts
+    for try_width in width_ladder(width, band):
+        token = nl_width_token(try_width)
+        if band == "6":
+            center = he_center_6(channel, try_width)
+            if center and try_width >= 40:
+                attempts.append((["iw", "dev", iface, "set", "freq", str(freq), token, str(center)], try_width))
+            attempts.append((["iw", "dev", iface, "set", "freq", str(freq), token], try_width))
+        else:
+            attempts.append((["iw", "dev", iface, "set", "channel", str(channel), ht_flag(try_width, channel)], try_width))
+            if try_width >= 80:
+                center_map = VHT160_CENTER if try_width >= 160 else VHT80_CENTER
+                center_ch = center_map.get(channel)
+                if center_ch:
+                    attempts.append((["iw", "dev", iface, "set", "freq", str(freq), token, str(5000 + center_ch * 5)], try_width))
+            attempts.append((["iw", "dev", iface, "set", "freq", str(freq), token], try_width))
+    if band != "6":
+        attempts.append((["iw", "dev", iface, "set", "channel", str(channel), "HT20"], 20))
+    attempts.append((["iw", "dev", iface, "set", "freq", str(freq)], 20))
+    return attempts
+
+
+# ---------------------------------------------------------------------------
+# iw parsing
+# ---------------------------------------------------------------------------
+
+PHY_RE = re.compile(r"^Wiphy\s+(phy\d+)\b")
+FREQ_RE = re.compile(
+    r"^\s*\*\s+(\d+(?:\.\d+)?)\s+MHz\s+\[(\d+)\]\s+\((disabled|.+)\)",
+    re.IGNORECASE,
+)
+IFACE_PHY_RE = re.compile(r"^phy#(\d+)\s*$")
+CHANNEL_RE = re.compile(
+    r"channel\s+(\d+)\s+\((\d+(?:\.\d+)?)\s+MHz\)(?:,\s+width:\s+(\d+)\s+MHz)?(?:,\s+center1:\s+(\d+(?:\.\d+)?)\s+MHz)?",
+    re.IGNORECASE,
+)
+
+
+def _empty_band_caps() -> dict:
+    return {
+        "ht": False,
+        "vht": False,
+        "he": False,
+        "eht": False,
+        "max_width": 20,
+    }
+
+
+def _apply_cap_line(caps: dict, stripped: str) -> None:
+    lower = stripped.lower()
+    if stripped.startswith("HT20/HT40") or stripped == "HT40" or stripped.startswith("HT20/HT40:"):
+        caps["ht"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 40)
+    if stripped.startswith("VHT Capabilities"):
+        caps["vht"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 80)
+    if "supported channel width:" in lower:
+        caps["vht"] = True
+        if "neither" in lower:
+            caps["max_width"] = max(int(caps["max_width"]), 80)
+        elif "320" in lower:
+            caps["eht"] = True
+            caps["max_width"] = max(int(caps["max_width"]), 320)
+        elif "160" in lower or "80+80" in lower:
+            caps["max_width"] = max(int(caps["max_width"]), 160)
+        elif "80" in lower:
+            caps["max_width"] = max(int(caps["max_width"]), 80)
+    if stripped.startswith("HE Iftypes") or stripped.startswith("HE MAC") or stripped.startswith("HE PHY"):
+        caps["he"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 80)
+    if "he40/he80/he160" in lower or re.search(r"\bhe160\b", lower):
+        caps["he"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 160)
+    elif "he40/he80" in lower:
+        caps["he"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 80)
+    if "mcs and nss set" in lower:
+        caps["he"] = True
+        if "320" in lower:
+            caps["eht"] = True
+            caps["max_width"] = max(int(caps["max_width"]), 320)
+        elif "160" in lower:
+            caps["max_width"] = max(int(caps["max_width"]), 160)
+        elif "80" in lower:
+            caps["max_width"] = max(int(caps["max_width"]), 80)
+    if stripped.startswith("EHT Iftypes") or stripped.startswith("EHT MAC") or stripped.startswith("EHT PHY"):
+        caps["eht"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 160)
+    if re.search(r"\b320\s*mhz\b", lower) or "eht320" in lower or "he40/he80/he160/eht320" in lower:
+        caps["eht"] = True
+        caps["max_width"] = max(int(caps["max_width"]), 320)
+
+
+def _merge_band_caps(dst: dict, src: dict) -> dict:
+    if not src:
+        return dst
+    for key in ("ht", "vht", "he", "eht"):
+        dst[key] = bool(dst.get(key) or src.get(key))
+    dst["max_width"] = max(int(dst.get("max_width") or 20), int(src.get("max_width") or 20))
+    return dst
+
+
+def build_capabilities(info: dict, learned: dict | None = None) -> dict:
+    channels_by_band: dict[str, list[int]] = {"2.4": [], "5": [], "6": []}
+    radar_by_band: dict[str, list[int]] = {"2.4": [], "5": [], "6": []}
+    for ch in info.get("channels") or []:
+        band = str(ch.get("band") or "")
+        if band not in channels_by_band:
+            continue
+        try:
+            num = int(ch.get("channel") or 0)
+        except (TypeError, ValueError):
+            continue
+        if num <= 0 or num in channels_by_band[band]:
+            continue
+        channels_by_band[band].append(num)
+        if ch.get("radar"):
+            radar_by_band[band].append(num)
+    for band in channels_by_band:
+        channels_by_band[band].sort()
+        radar_by_band[band].sort()
+    band_caps = info.get("band_caps") or {}
+    max_width: dict[str, int] = {}
+    ht = vht = he = eht = False
+    for band, caps in band_caps.items():
+        max_width[str(band)] = int(caps.get("max_width") or 20)
+        ht = ht or bool(caps.get("ht"))
+        vht = vht or bool(caps.get("vht"))
+        he = he or bool(caps.get("he"))
+        eht = eht or bool(caps.get("eht"))
+    for band in info.get("bands") or []:
+        if band not in max_width:
+            max_width[band] = {"2.4": 40, "5": 80, "6": 80}.get(band, 20)
+    # STA HE MCS on 6 GHz often undersells monitor RX; offer 160 unless EHT/320 is present.
+    if "6" in max_width and he and max_width["6"] < 160:
+        max_width["6"] = 160
+    learned_width: dict[str, int] = {}
+    for band, value in (learned or {}).items():
+        try:
+            width = int(value)
+        except (TypeError, ValueError):
+            continue
+        if width > 0:
+            learned_width[str(band)] = width
+            max_width[str(band)] = max(int(max_width.get(str(band)) or 20), width)
+    if "2.4" in max_width:
+        max_width["2.4"] = min(int(max_width["2.4"]), 40)
+    return {
+        "bands": list(info.get("bands") or []),
+        "max_width": max_width,
+        "learned_width": learned_width,
+        "ht": ht,
+        "vht": vht,
+        "he": he,
+        "eht": eht,
+        "channels": {band: chans for band, chans in channels_by_band.items() if chans},
+        "radar": {band: chans for band, chans in radar_by_band.items() if chans},
+    }
+
+
+def parse_iw_phy(text: str) -> dict[str, dict]:
+    phys: dict[str, dict] = {}
+    current: dict | None = None
+    section = ""
+    modes: list[str] = []
+    frequencies: list[dict] = []
+    band_caps: dict[str, dict] = {}
+    open_band: dict | None = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        match = PHY_RE.match(line)
+        if match:
+            if current is not None:
+                current["modes"] = modes
+                current["frequencies"] = frequencies
+                current["band_caps"] = band_caps
+                phys[current["phy"]] = current
+            current = {
+                "phy": match.group(1),
+                "modes": [],
+                "frequencies": [],
+                "bands": [],
+                "band_caps": {},
+                "max_scan_ssids": 0,
+                "interface_combinations": "",
+                "software_monitor": False,
+                "no_combinations": False,
+            }
+            modes = []
+            frequencies = []
+            band_caps = {}
+            open_band = None
+            section = ""
+            continue
+        if current is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("Supported interface modes:"):
+            section = "modes"
+            continue
+        if stripped.startswith("software interface modes"):
+            section = "software"
+            continue
+        if stripped.startswith("Frequencies:"):
+            section = "freq"
+            continue
+        if stripped.startswith("Band "):
+            section = "band"
+            open_band = _empty_band_caps()
+            continue
+        if stripped.startswith("valid interface combinations:") or stripped.startswith("interface combinations"):
+            section = "combo"
+            continue
+        if not line.startswith(" ") and not line.startswith("\t"):
+            section = ""
+            continue
+        if section == "modes" and stripped.startswith("*"):
+            modes.append(stripped[1:].strip())
+        elif section == "software" and "monitor" in stripped:
+            current["software_monitor"] = True
+        elif section == "combo" and "not supported" in stripped.lower():
+            current["no_combinations"] = True
+        if open_band is not None and section in ("band", "freq"):
+            _apply_cap_line(open_band, stripped)
+        if section == "freq":
+            freq_match = FREQ_RE.match(line)
+            if freq_match:
+                mhz = float(freq_match.group(1))
+                channel = int(freq_match.group(2))
+                rest = freq_match.group(3)
+                disabled = rest.lower().startswith("disabled")
+                band = band_of_freq(mhz)
+                frequencies.append({
+                    "mhz": int(mhz) if mhz == int(mhz) else mhz,
+                    "channel": channel,
+                    "band": band,
+                    "disabled": disabled,
+                    "no_ir": "no ir" in rest.lower(),
+                    "radar": "radar" in rest.lower(),
+                    "dbm": None if disabled else _parse_dbm(rest),
+                })
+                if open_band is not None and band:
+                    band_caps[band] = _merge_band_caps(band_caps.get(band) or _empty_band_caps(), open_band)
+        elif "max # scan SSIDs:" in stripped:
+            try:
+                current["max_scan_ssids"] = int(stripped.split(":")[-1].strip())
+            except ValueError:
+                pass
+    if current is not None:
+        current["modes"] = modes
+        current["frequencies"] = frequencies
+        current["band_caps"] = band_caps
+        phys[current["phy"]] = current
+    for phy in phys.values():
+        bands = []
+        for freq in phy["frequencies"]:
+            if freq["band"] and freq["band"] not in bands:
+                bands.append(freq["band"])
+        phy["bands"] = bands
+        phy["channels"] = [
+            {
+                "channel": f["channel"],
+                "mhz": f["mhz"],
+                "band": f["band"],
+                "disabled": f["disabled"],
+                "radar": f["radar"],
+                "no_ir": f["no_ir"],
+            }
+            for f in phy["frequencies"]
+            if not f["disabled"]
+        ]
+    return phys
+
+
+def _parse_dbm(rest: str) -> float | None:
+    match = re.search(r"(-?\d+(?:\.\d+)?)\s*dBm", rest)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def parse_iw_dev(text: str) -> list[dict]:
+    ifaces: list[dict] = []
+    current: dict | None = None
+    phy = ""
+    skipping_unnamed = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        phy_match = IFACE_PHY_RE.match(line)
+        if phy_match:
+            phy = f"phy{phy_match.group(1)}"
+            skipping_unnamed = False
+            continue
+        if "Unnamed/non-netdev interface" in line:
+            if current:
+                ifaces.append(current)
+                current = None
+            skipping_unnamed = True
+            continue
+        if line.startswith("Interface ") or line.startswith("\tInterface "):
+            skipping_unnamed = False
+            if current:
+                ifaces.append(current)
+            name = line.strip().split()[-1]
+            current = {
+                "iface": name,
+                "phy": phy,
+                "ifindex": 0,
+                "mac": "",
+                "ssid": "",
+                "type": "",
+                "channel": 0,
+                "freq": 0,
+                "width": 0,
+                "center1": 0,
+                "txpower": None,
+            }
+            continue
+        if skipping_unnamed or current is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("ifindex "):
+            try:
+                current["ifindex"] = int(stripped.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif stripped.startswith("addr "):
+            current["mac"] = mac_colon(stripped.split()[1])
+        elif stripped.startswith("ssid "):
+            current["ssid"] = stripped[5:]
+        elif stripped.startswith("type "):
+            current["type"] = stripped.split()[1]
+        elif stripped.startswith("txpower "):
+            try:
+                current["txpower"] = float(stripped.split()[1])
+            except (IndexError, ValueError):
+                pass
+        else:
+            ch = CHANNEL_RE.search(stripped)
+            if ch:
+                current["channel"] = int(ch.group(1))
+                current["freq"] = float(ch.group(2))
+                current["width"] = int(ch.group(3) or 0)
+                current["center1"] = float(ch.group(4) or 0)
+    if current:
+        ifaces.append(current)
+    return ifaces
+
+
+def parse_nmcli_devices(text: str) -> dict[str, dict]:
+    devices: dict[str, dict] = {}
+    for line in text.splitlines():
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        name, dtype, state = parts[0], parts[1], parts[2]
+        connection = parts[3] if len(parts) > 3 else ""
+        devices[name] = {
+            "type": dtype,
+            "state": state,
+            "connection": connection,
+            "managed": state not in ("unmanaged",),
+        }
+    return devices
+
+
+def phy_sysfs(phy: str) -> dict:
+    root = Path("/sys/class/ieee80211") / phy
+    device = root / "device"
+    uevent = sysfs_uevent(device)
+    mac = read_text(root / "macaddress") or read_text(root / "address")
+    index = read_text(root / "index")
+    driver = read_link(device / "driver") or uevent.get("DRIVER", "")
+    return {
+        "phy": phy,
+        "index": int(index) if index.isdigit() else -1,
+        "mac": mac_colon(mac) if mac else "",
+        "driver": driver,
+        "bus": bus_for(device),
+        "product": product_for(device, uevent),
+        "uevent": {
+            "pci_id": uevent.get("PCI_ID", ""),
+            "product": uevent.get("PRODUCT", ""),
+            "driver": uevent.get("DRIVER", driver),
+        },
+    }
+
+
+def list_phys() -> list[str]:
+    root = Path("/sys/class/ieee80211")
+    if not root.is_dir():
+        return []
+    return sorted(p.name for p in root.iterdir() if p.name.startswith("phy"))
+
+
+def iface_exists(name: str) -> bool:
+    return bool(name) and Path(f"/sys/class/net/{name}").exists()
+
+
+def iface_operstate(iface: str) -> str:
+    return read_text(Path("/sys/class/net") / iface / "operstate", "unknown")
+
+
+def iface_rx_tx(iface: str) -> tuple[int, int]:
+    stats = Path("/sys/class/net") / iface / "statistics"
+    try:
+        rx = int(read_text(stats / "rx_bytes", "0") or "0")
+        tx = int(read_text(stats / "tx_bytes", "0") or "0")
+    except ValueError:
+        return 0, 0
+    return rx, tx
+
+
+# ---------------------------------------------------------------------------
+# 802.11 / radiotap
+# ---------------------------------------------------------------------------
+
+RT_ALIGN = {
+    0: (8, 8),   # TSFT
+    1: (1, 1),   # flags
+    2: (1, 1),   # rate
+    3: (2, 4),   # channel
+    4: (2, 2),   # fhss
+    5: (1, 1),   # dbm antsignal
+    6: (1, 1),   # dbm antnoise
+    11: (1, 1),  # antenna
+    14: (2, 2),  # rx flags
+    19: (1, 3),  # mcs
+    20: (4, 8),  # ampdu
+    21: (2, 12), # vht
+}
+
+
+def _align(offset: int, align: int) -> int:
+    if align <= 1:
+        return offset
+    rem = offset % align
+    return offset if rem == 0 else offset + (align - rem)
+
+
+def parse_radiotap(buf: bytes) -> dict | None:
+    if len(buf) < 8:
+        return None
+    length = struct.unpack_from("<H", buf, 2)[0]
+    if length < 8 or length > len(buf):
+        return None
+    offset = 4
+    present_words: list[int] = []
+    while offset + 4 <= length:
+        word = struct.unpack_from("<I", buf, offset)[0]
+        present_words.append(word)
+        offset += 4
+        if not (word & 0x80000000):
+            break
+    else:
+        return None
+    info = {
+        "length": length,
+        "flags": 0,
+        "rate": 0,
+        "freq": 0,
+        "rssi": None,
+        "antenna": None,
+        "has_fcs": False,
+    }
+    for word_index, word in enumerate(present_words):
+        if word_index > 0:
+            continue
+        for bit in range(32):
+            if not (word & (1 << bit)):
+                continue
+            size_align = RT_ALIGN.get(bit)
+            if size_align is None:
+                break
+            align, size = size_align
+            offset = _align(offset, align)
+            if offset + size > length:
+                return info
+            field = buf[offset:offset + size]
+            offset += size
+            if bit == 1:
+                info["flags"] = field[0]
+                info["has_fcs"] = bool(field[0] & 0x10)
+            elif bit == 2:
+                info["rate"] = field[0]
+            elif bit == 3:
+                info["freq"] = struct.unpack_from("<H", field, 0)[0]
+            elif bit == 5:
+                info["rssi"] = struct.unpack("b", field[:1])[0]
+            elif bit == 11:
+                info["antenna"] = field[0]
+    return info
+
+
+def _vht_operating_width(code: int, ccfs0: int = 0, ccfs1: int = 0) -> int:
+    """BSS operating width from VHT Operation, not VHT Capabilities.
+
+    Deprecated encoding: 1=80, 2=160, 3=80+80.
+    IEEE 802.11-2016+: 1 means 80, 160, or 80+80 and CCFS1 distinguishes
+    (|CCFS1-CCFS0|==8 → 160, >8 → 80+80). Many APs still set width=1 for 80
+    with CCFS1=0; that is 80 MHz, not 160.
+    """
+    code = int(code) & 0x03
+    ccfs0 = int(ccfs0 or 0)
+    ccfs1 = int(ccfs1 or 0)
+    if code == 1 and ccfs1:
+        diff = abs(ccfs1 - ccfs0)
+        if diff == 8 or diff > 8:
+            return 160
+        return 80
+    if code == 0:
+        return 0
+    if code == 1:
+        return 80
+    if code in (2, 3):
+        return 160
+    return 0
+
+
+def _he6_operating_width(control_cw: int, ccfs0: int = 0, ccfs1: int = 0) -> int:
+    cw = int(control_cw) & 0x03
+    if cw == 0:
+        return 20
+    if cw == 1:
+        return 40
+    if cw == 2:
+        return 80
+    ccfs0 = int(ccfs0 or 0)
+    ccfs1 = int(ccfs1 or 0)
+    if ccfs1 and abs(ccfs1 - ccfs0) >= 8:
+        return 160
+    return 160 if ccfs1 else 80
+
+
+def _clamp_bss_width(width: int, band: str) -> int:
+    try:
+        w = int(width or 20)
+    except (TypeError, ValueError):
+        w = 20
+    if w <= 0:
+        w = 20
+    if band == "2.4":
+        return 40 if w >= 40 else 20
+    for step in (320, 160, 80, 40, 20, 10, 5):
+        if w >= step:
+            return step
+    return 20
+
+
+def _he_op_width(data: bytes) -> int:
+    # HE Operation: params(3) + BSS color(1) + basic MCS(2)
+    # optional VHT op(3), max cohosted BSSID(1), 6 GHz op info(5)
+    if len(data) < 7:
+        return 0
+    params = int.from_bytes(data[0:3], "little")
+    pos = 6
+    if params & 0x00004000:  # VHT Operation Information Present
+        pos += 3
+    if params & 0x00008000:  # Co-hosted BSS
+        pos += 1
+    if params & 0x00020000 and len(data) >= pos + 5:  # 6 GHz Operation Information
+        control = data[pos + 1]
+        return _he6_operating_width(control, data[pos + 2], data[pos + 3])
+    return 0
+
+
+def parse_ies(body: bytes) -> dict:
+    ssid = None
+    channel = 0
+    rsn = False
+    wpa = False
+    ht = False
+    vht = False
+    he = False
+    ht_width = 20
+    vht_width = 0
+    he6_width = 0
+    offset = 0
+    while offset + 2 <= len(body):
+        tag = body[offset]
+        length = body[offset + 1]
+        offset += 2
+        if offset + length > len(body):
+            break
+        data = body[offset:offset + length]
+        offset += length
+        if tag == 0:
+            try:
+                ssid = data.decode("utf-8", errors="replace")
+            except Exception:
+                ssid = data.decode("latin1", errors="replace")
+        elif tag == 3 and data:
+            channel = data[0]
+        elif tag == 48:
+            rsn = True
+        elif tag == 45:
+            ht = True
+        elif tag == 61 and len(data) >= 2:  # HT Operation
+            ht = True
+            sec = data[1] & 0x03
+            ht_width = 40 if sec in (1, 3) else 20
+        elif tag == 191:
+            vht = True
+        elif tag == 192 and data:  # VHT Operation
+            vht = True
+            ccfs0 = data[1] if len(data) >= 2 else 0
+            ccfs1 = data[2] if len(data) >= 3 else 0
+            vht_width = _vht_operating_width(data[0], ccfs0, ccfs1)
+        elif tag == 255 and data:
+            ext = data[0]
+            if ext == 35:
+                he = True
+            elif ext == 36:
+                he = True
+                he6_width = _he_op_width(data[1:])
+        elif tag == 221 and len(data) >= 4 and data[:3] == b"\x00\x50\xf2" and data[3] == 1:
+            wpa = True
+    return {
+        "ssid": ssid,
+        "channel": channel,
+        "rsn": rsn,
+        "wpa": wpa,
+        "ht": ht,
+        "vht": vht,
+        "he": he,
+        "ht_width": ht_width,
+        "vht_width": vht_width,
+        "he6_width": he6_width,
+        "width": vht_width or ht_width or 20,
+    }
+
+
+def _prefer_width(new, old) -> int:
+    try:
+        n = int(new or 0)
+    except (TypeError, ValueError):
+        n = 0
+    try:
+        o = int(old or 0)
+    except (TypeError, ValueError):
+        o = 0
+    return n if n > 0 else o
+
+
+def security_label(cap: int, ies: dict) -> str:
+    privacy = bool(cap & 0x0010)
+    if ies.get("rsn"):
+        return "WPA3/WPA2" if ies.get("he") else "WPA2/WPA3"
+    if ies.get("wpa"):
+        return "WPA"
+    if privacy:
+        return "WEP/Privacy"
+    return "Open"
+
+
+def parse_mgmt_frame(frame: bytes, rt: dict) -> dict | None:
+    if len(frame) < 24:
+        return None
+    if rt.get("has_fcs") and len(frame) >= 28:
+        frame = frame[:-4]
+    fc = struct.unpack_from("<H", frame, 0)[0]
+    ftype = (fc >> 2) & 0x3
+    subtype = (fc >> 4) & 0xF
+    addr1 = mac_colon(frame[4:10])
+    addr2 = mac_colon(frame[10:16])
+    addr3 = mac_colon(frame[16:22])
+    freq = rt.get("freq") or 0
+    rssi = rt.get("rssi")
+    if ftype != 0:
+        return None
+    if subtype in (8, 5):  # beacon / probe response
+        if len(frame) < 36:
+            return None
+        cap = struct.unpack_from("<H", frame, 34)[0]
+        ies = parse_ies(frame[36:])
+        channel = ies["channel"]
+        if freq and (not channel or freq >= 5925):
+            if 5925 <= freq < 7125:
+                channel = int(round((freq - 5950) / 5))
+            elif 2412 <= freq <= 2484:
+                channel = 14 if freq == 2484 else (freq - 2407) // 5
+            elif 5000 <= freq < 5925:
+                channel = (freq - 5000) // 5
+        return {
+            "kind": "ap",
+            "bssid": addr3,
+            "src": addr2,
+            "ssid": ies["ssid"],
+            "hidden": ies["ssid"] is None or ies["ssid"] == "",
+            "channel": channel,
+            "freq": freq,
+            "band": band_of_freq(freq),
+            "rssi": rssi,
+            "security": security_label(cap, ies),
+            "ht": ies["ht"],
+            "vht": ies["vht"],
+            "he": ies["he"],
+            "width": (ies.get("he6_width") if freq >= 5925 else 0) or ies.get("vht_width") or ies.get("ht_width") or 20,
+        }
+    if subtype == 4:  # probe request
+        ies = parse_ies(frame[24:])
+        return {
+            "kind": "probe",
+            "client": addr2,
+            "dst": addr1,
+            "ssid": ies["ssid"] or "",
+            "freq": freq,
+            "band": band_of_freq(freq),
+            "rssi": rssi,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# pcap writer
+# ---------------------------------------------------------------------------
+
+class PcapWriter:
+    def __init__(self, path: Path, dlt: int = DLT_IEEE802_11_RADIO, kind: str = "live"):
+        self.path = path
+        self.dlt = int(dlt)
+        self.kind = kind
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fp = self.path.open("wb")
+        self.fp.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, SNAPLEN, self.dlt))
+        self.fp.flush()
+        self.packets = 0
+        self.bytes = 24
+        self.lock = threading.Lock()
+
+    def write(self, packet: bytes) -> None:
+        now = time.time()
+        sec = int(now)
+        usec = int((now - sec) * 1_000_000)
+        data = packet[:SNAPLEN]
+        header = struct.pack("<IIII", sec, usec, len(data), len(packet))
+        with self.lock:
+            self.fp.write(header + data)
+            self.fp.flush()
+            self.packets += 1
+            self.bytes += 16 + len(data)
+
+    def close(self) -> None:
+        with self.lock:
+            try:
+                self.fp.flush()
+                self.fp.close()
+            except OSError:
+                pass
+
+
+class SurveyLog:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fp = self.path.open("a", encoding="utf-8")
+        self.rows = 0
+
+    def write(self, obj: dict) -> None:
+        self.fp.write(json.dumps(obj) + "\n")
+        self.fp.flush()
+        self.rows += 1
+
+    def close(self) -> None:
+        try:
+            self.fp.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# inventory
+# ---------------------------------------------------------------------------
+
+_phy_cache: dict[str, dict] = {}
+_phy_cache_at = 0.0
+
+
+def iw_phy_info(phy: str | None = None) -> dict[str, dict]:
+    global _phy_cache, _phy_cache_at
+    now = time.time()
+    if _phy_cache and now - _phy_cache_at < 8:
+        return _phy_cache
+    args = ["iw", "phy"]
+    if phy:
+        args.extend([phy, "info"])
+    code, out, _err = run(args, timeout=8)
+    parsed = parse_iw_phy(out) if code == 0 else {}
+    if parsed:
+        _phy_cache = parsed
+        _phy_cache_at = now
+    return parsed or _phy_cache
+
+
+def collect_inventory(extra: dict | None = None) -> dict:
+    extra = extra or {}
+    phys_info = iw_phy_info()
+    code, dev_out, _ = run(["iw", "dev"], timeout=5)
+    ifaces = parse_iw_dev(dev_out) if code == 0 else []
+    _nm_code, nm_out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"], timeout=4)
+    nm = parse_nmcli_devices(nm_out)
+    by_phy: dict[str, list[dict]] = {}
+    for iface in ifaces:
+        phy = iface.get("phy") or ""
+        iface["operstate"] = iface_operstate(iface["iface"])
+        iface["rx_bytes"], iface["tx_bytes"] = iface_rx_tx(iface["iface"])
+        nm_info = nm.get(iface["iface"], {})
+        iface["nm_state"] = nm_info.get("state", "")
+        iface["nm_managed"] = nm_info.get("managed", False)
+        iface["nm_connection"] = nm_info.get("connection", "")
+        iface["band"] = band_of_freq(iface.get("freq"))
+        by_phy.setdefault(phy, []).append(iface)
+
+    radios = []
+    route_iface = default_route_iface()
+    for phy in list_phys():
+        sysfs = phy_sysfs(phy)
+        info = phys_info.get(phy, {})
+        phy_ifaces = by_phy.get(phy, [])
+        radio_extra = (extra.get("radios") or {}).get(phy, {})
+        station = next((i for i in phy_ifaces if i.get("type") == "managed"), None)
+        monitor = next((i for i in phy_ifaces if i.get("type") == "monitor"), None)
+        if radio_extra.get("monitor_iface"):
+            monitor = next((i for i in phy_ifaces if i["iface"] == radio_extra["monitor_iface"]), monitor)
+        live = station or monitor or (phy_ifaces[0] if phy_ifaces else None)
+        role = radio_extra.get("role")
+        if radio_extra.get("disabled"):
+            role = "station"
+        elif not role:
+            if monitor and radio_extra.get("hop_channels"):
+                role = "hopper"
+            elif monitor:
+                role = "monitor"
+            elif radio_extra.get("role") == "active":
+                role = "active"
+            else:
+                role = "station"
+        passive = supports_passive_monitor(sysfs, info)
+        caps = build_capabilities(info, radio_extra.get("learned_width") or {})
+        caps["passive_monitor"] = passive
+        station_name = (station or {}).get("iface", "")
+        error = radio_extra.get("error", "") or ""
+        if station and str(station.get("nm_state") or "").startswith("connected"):
+            error = ""
+        radios.append({
+            "phy": phy,
+            "index": sysfs["index"],
+            "mac": sysfs["mac"] or (live or {}).get("mac", ""),
+            "driver": sysfs["driver"],
+            "bus": sysfs["bus"],
+            "product": sysfs["product"] or sysfs["driver"] or phy,
+            "modes": info.get("modes") or [],
+            "bands": info.get("bands") or [],
+            "software_monitor": bool(info.get("software_monitor")),
+            "can_monitor": "monitor" in (info.get("modes") or []) or bool(info.get("software_monitor")),
+            "passive_monitor": passive,
+            "capabilities": caps,
+            "channels": info.get("channels") or [],
+            "ifaces": phy_ifaces,
+            "station_iface": (station or {}).get("iface", ""),
+            "monitor_iface": (monitor or {}).get("iface", "") or radio_extra.get("monitor_iface", ""),
+            "role": role,
+            "channel": radio_extra.get("channel") or (live or {}).get("channel") or 0,
+            "width": radio_extra.get("width") or (live or {}).get("width") or 0,
+            "band": radio_extra.get("band") or (live or {}).get("band") or "",
+            "freq": radio_extra.get("freq") or (live or {}).get("freq") or 0,
+            "ssid": (station or {}).get("ssid", ""),
+            "capturing": bool(radio_extra.get("capturing")),
+            "capture_path": radio_extra.get("capture_path", ""),
+            "capture_packets": radio_extra.get("capture_packets", 0),
+            "capture_bytes": radio_extra.get("capture_bytes", 0),
+            "capture_iface": radio_extra.get("capture_iface", ""),
+            "hop_channels": radio_extra.get("hop_channels") or [],
+            "hop_band": radio_extra.get("hop_band") or "",
+            "dwell_ms": radio_extra.get("dwell_ms") or 0,
+            "stolen": bool(radio_extra.get("stolen_iface")),
+            "stolen_iface": radio_extra.get("stolen_iface", ""),
+            "converted_iface": radio_extra.get("converted_iface", ""),
+            "original_iface": radio_extra.get("original_iface", ""),
+            "disabled": bool(radio_extra.get("disabled")),
+            "uplink": radio_is_uplink(sysfs, station_name, route_iface),
+            "lab": is_lab_radio(sysfs),
+            "nm_managed": bool((station or {}).get("nm_managed")),
+            "last_scan": radio_extra.get("last_scan"),
+            "note": radio_extra.get("note", ""),
+            "error": error,
+        })
+
+    helper = extra.get("helper") or {
+        "state": "stopped" if not socket_alive() else "running",
+        "socket": DEFAULT_SOCKET,
+    }
+    return {
+        "ok": True,
+        "plugin": PLUGIN_ID,
+        "ts": utc_now(),
+        "helper": helper,
+        "capture_dir": extra.get("capture_dir") or default_capture_dir(),
+        "radio_count": len(radios),
+        "monitor_count": sum(1 for r in radios if r["role"] in ("monitor", "hopper")),
+        "capture_count": sum(1 for r in radios if r["capturing"]),
+        "station_count": sum(1 for r in radios if r["role"] == "station" and r.get("ssid")),
+        "radios": radios,
+        "air": extra.get("air") or [],
+        "clients": extra.get("clients") or [],
+        "captures": extra.get("captures") or list_captures(extra.get("capture_dir") or default_capture_dir()),
+    }
+
+
+def default_capture_dir() -> str:
+    home = os.environ.get("HOME") or str(Path.home())
+    return str(Path(home) / "radio-lab" / "captures")
+
+
+def list_captures(directory: str, limit: int = 12) -> list[dict]:
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+    files = sorted(list(root.glob("*.pcap")) + list(root.glob("*.jsonl")), key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for path in files[:limit]:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        out.append({
+            "name": path.name,
+            "path": str(path),
+            "bytes": st.st_size,
+            "mtime": int(st.st_mtime),
+        })
+    return out
+
+
+def socket_alive(path: str = DEFAULT_SOCKET) -> bool:
+    if not os.path.exists(path):
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(0.4)
+    try:
+        sock.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# daemon
+# ---------------------------------------------------------------------------
+
+class RadioLab:
+    def __init__(self, allow_uid: int, capture_dir: str, sock_path: str):
+        self.allow_uid = allow_uid
+        self.capture_dir = Path(capture_dir)
+        self.capture_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chown(self.capture_dir, allow_uid, -1)
+        except OSError:
+            pass
+        self.sock_path = sock_path
+        self.lock = threading.RLock()
+        self.tune_lock = threading.Lock()
+        self.radios: dict[str, dict] = {}
+        self.air: OrderedDict[str, dict] = OrderedDict()
+        self.clients: OrderedDict[str, dict] = OrderedDict()
+        self.sniffers: dict[str, threading.Event] = {}
+        self.scanners: dict[str, threading.Event] = {}
+        self.writers: dict[str, PcapWriter] = {}
+        self.surveys: dict[str, object] = {}
+        self.stop = threading.Event()
+        Path(DEFAULT_DIR).mkdir(parents=True, exist_ok=True)
+
+    def helper_meta(self) -> dict:
+        return {
+            "state": "running",
+            "socket": self.sock_path,
+            "pid": os.getpid(),
+            "allow_uid": self.allow_uid,
+            "capture_dir": str(self.capture_dir),
+        }
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            radios = json.loads(json.dumps(self.radios))
+            air = list(self.air.values())
+            clients = list(self.clients.values())[-40:]
+            for phy, entry in radios.items():
+                writer = (
+                    self.writers.get(entry.get("capture_iface") or "")
+                    or self.writers.get(entry.get("monitor_iface") or "")
+                    or self.writers.get(entry.get("station_iface") or "")
+                )
+                survey = self.surveys.get(phy)
+                if writer:
+                    entry["capturing"] = True
+                    entry["capture_path"] = str(writer.path)
+                    entry["capture_packets"] = writer.packets
+                    entry["capture_bytes"] = writer.bytes
+                elif survey:
+                    entry["capturing"] = True
+                    entry["capture_path"] = str(survey.path)
+                    entry["capture_packets"] = survey.rows
+                    entry["capture_bytes"] = 0
+            extra = {
+                "helper": self.helper_meta(),
+                "capture_dir": str(self.capture_dir),
+                "radios": radios,
+                "air": air,
+                "clients": clients,
+                "captures": list_captures(str(self.capture_dir)),
+            }
+        return collect_inventory(extra)
+
+    def persist_status(self) -> None:
+        try:
+            payload = self.snapshot()
+            path = Path(DEFAULT_STATUS)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
+            os.chmod(path, 0o644)
+        except OSError:
+            pass
+
+    def adopt(self) -> None:
+        inventory = collect_inventory()
+        with self.lock:
+            for radio in inventory["radios"]:
+                phy = radio["phy"]
+                existing = self.radios.get(phy, {})
+                if radio.get("monitor_iface"):
+                    existing.setdefault("role", "monitor")
+                    existing["monitor_iface"] = radio["monitor_iface"]
+                    existing["channel"] = radio.get("channel") or existing.get("channel") or 0
+                    existing["width"] = radio.get("width") or existing.get("width") or 20
+                    self.radios[phy] = existing
+                    self.ensure_sniffer(radio["monitor_iface"])
+
+    def phy_of_iface(self, iface: str) -> str | None:
+        code, out, _ = run(["iw", "dev", iface, "info"], timeout=4)
+        if code != 0:
+            return None
+        for line in out.splitlines():
+            if line.strip().startswith("wiphy "):
+                return f"phy{line.strip().split()[1]}"
+            if line.strip().startswith("phy#"):
+                return f"phy{line.strip()[4:]}"
+        inventory = collect_inventory({"radios": self.radios})
+        for radio in inventory["radios"]:
+            for item in radio.get("ifaces") or []:
+                if item.get("iface") == iface:
+                    return radio["phy"]
+        return None
+
+    def handle(self, req: dict) -> dict:
+        cmd = str(req.get("cmd") or "")
+        try:
+            if cmd == "status":
+                return {"ok": True, "data": self.snapshot()}
+            if cmd == "monitor_on":
+                return self.monitor_on(req)
+            if cmd == "monitor_off":
+                return self.monitor_off(req)
+            if cmd == "set_channel":
+                return self.set_channel(req)
+            if cmd == "hop_start":
+                return self.hop_start(req)
+            if cmd == "scan_start":
+                return self.scan_start(req)
+            if cmd == "hop_stop":
+                return self.hop_stop(req)
+            if cmd == "scan_stop":
+                return self.hop_stop(req)
+            if cmd == "capture_start":
+                return self.capture_start(req)
+            if cmd == "capture_stop":
+                return self.capture_stop(req)
+            if cmd == "restore":
+                return self.restore(req)
+            if cmd == "restore_wifi":
+                return self.restore_wifi(req)
+            if cmd == "disable":
+                return self.disable_radio(req)
+            if cmd == "enable":
+                return self.enable_radio(req)
+            if cmd == "active_scan_start":
+                return self.active_scan_start(req)
+            if cmd == "active_scan_stop":
+                return self.active_scan_stop(req)
+            if cmd == "survey":
+                return self.survey(req)
+            if cmd == "ping":
+                return {"ok": True, "data": {"pid": os.getpid()}}
+            return {"ok": False, "error": f"unknown command {cmd}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _radio(self, phy: str) -> dict:
+        with self.lock:
+            return self.radios.setdefault(phy, {})
+
+    def _note_error(self, phy: str, message: str) -> None:
+        with self.lock:
+            self.radios.setdefault(phy, {})["error"] = message
+
+    def monitor_on(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        if not phy:
+            return {"ok": False, "error": "phy is required"}
+        steal = bool(req.get("steal"))
+        channel = int(req.get("channel") or 0)
+        width = int(req.get("width") or 20)
+        band = str(req.get("band") or "")
+        mhz = int(req.get("freq") or req.get("mhz") or 0)
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if radio is None:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        self._stop_scan(phy)
+        if not radio.get("passive_monitor"):
+            return self.active_scan_start(req)
+        if not radio.get("can_monitor"):
+            return {"ok": False, "error": f"{phy} does not advertise monitor mode"}
+        if radio.get("uplink") and not steal:
+            return {
+                "ok": False,
+                "error": f"{radio.get('product') or phy} is the internet Wi-Fi radio. Use Restore Wi-Fi if you already dropped the link, or confirm Use for lab to convert it.",
+                "needs_steal": True,
+                "uplink": True,
+            }
+
+        mon = radio.get("monitor_iface") or ""
+        already = mon and not mon.startswith(RLAB_PREFIX) and self._iface_type(mon) == "monitor"
+        if already:
+            iface = mon
+            stolen = (self.radios.get(phy) or {}).get("stolen_iface") or ""
+        else:
+            iface, stolen, err = self._create_monitor(phy, radio, steal)
+            if err:
+                self._note_error(phy, err)
+                return {"ok": False, "error": err, "needs_steal": "only station" in err}
+            with self.lock:
+                state = self._radio(phy)
+                state["monitor_iface"] = iface
+                state["stolen_iface"] = stolen or ""
+                state["role"] = "monitor"
+                state["disabled"] = False
+                state["error"] = ""
+                if stolen:
+                    state["note"] = f"converted {stolen} to monitor"
+                elif iface and not iface.startswith(RLAB_PREFIX):
+                    state["converted_iface"] = iface
+                    state["original_iface"] = state.get("original_iface") or iface
+                    state["note"] = f"converted {iface} to monitor"
+
+        with self.lock:
+            self._radio(phy)["disabled"] = False
+            self._radio(phy)["role"] = "monitor"
+            if iface:
+                self._radio(phy)["monitor_iface"] = iface
+        self._silence_station(phy)
+        self.ensure_sniffer(iface)
+        if channel or mhz:
+            set_res = self.set_channel({
+                "phy": phy,
+                "iface": iface,
+                "channel": channel,
+                "width": width,
+                "band": band,
+                "freq": mhz,
+            })
+            if not set_res.get("ok"):
+                return set_res
+        else:
+            with self.lock:
+                self._radio(phy)["width"] = width or 20
+        return {"ok": True, "data": self.snapshot()}
+
+    def _unmanage_iface(self, name: str) -> None:
+        if not name:
+            return
+        run(["nmcli", "device", "set", name, "managed", "no"])
+        run(["nmcli", "device", "disconnect", name])
+
+    def _down_flush(self, name: str) -> None:
+        if not name or not iface_exists(name):
+            return
+        run(["ip", "link", "set", name, "down"])
+        run(["ip", "addr", "flush", "dev", name])
+
+    def _delete_iface(self, name: str) -> None:
+        if not name or not iface_exists(name):
+            return
+        self._stop_capture(name)
+        self._stop_sniffer(name)
+        self._down_flush(name)
+        run(["iw", "dev", name, "del"])
+
+    def _delete_rlab_on_phy(self, radio: dict) -> None:
+        for item in list(radio.get("ifaces") or []):
+            name = item.get("iface") or ""
+            if name.startswith(RLAB_PREFIX):
+                self._delete_iface(name)
+
+    def _convert_to_monitor(self, name: str) -> str | None:
+        if not name:
+            return "no interface to convert"
+        self._unmanage_iface(name)
+        self._down_flush(name)
+        conv = run(["iw", "dev", name, "set", "type", "monitor"])
+        if conv[0] != 0:
+            return (conv[2] or conv[1] or f"could not set {name} to monitor").strip()
+        run(["iw", "dev", name, "set", "power_save", "off"], timeout=3)
+        up = run(["ip", "link", "set", name, "up"])
+        if up[0] != 0:
+            return (up[2] or up[1] or f"failed to bring {name} up").strip()
+        run(["ip", "addr", "flush", "dev", name])
+        return None
+
+    def _convert_to_managed(self, name: str, up: bool = True) -> str:
+        if not name or not iface_exists(name):
+            return ""
+        kind = self._iface_type(name)
+        if kind and kind != "managed":
+            run(["ip", "link", "set", name, "down"])
+            conv = run(["iw", "dev", name, "set", "type", "managed"])
+            if conv[0] != 0:
+                return (conv[2] or conv[1] or f"could not restore {name}").strip()
+        run(["ip", "addr", "flush", "dev", name])
+        if up:
+            run(["ip", "link", "set", name, "up"])
+        else:
+            run(["ip", "link", "set", name, "down"])
+        return ""
+
+    def _remember_original(self, phy: str, name: str) -> None:
+        if not name or name.startswith(RLAB_PREFIX):
+            return
+        with self.lock:
+            state = self._radio(phy)
+            state["original_iface"] = name
+            state["converted_iface"] = name
+
+    def _create_monitor(self, phy: str, radio: dict, steal: bool) -> tuple[str, str | None, str | None]:
+        index = radio.get("index")
+        if index is None or index < 0:
+            index = int(phy.replace("phy", "") or 0)
+        station = self._station_name(radio)
+        if station.startswith(RLAB_PREFIX):
+            station = ""
+        self._remember_original(phy, station)
+        self._delete_rlab_on_phy(radio)
+
+        lab = bool(radio.get("lab") or radio.get("bus") == "usb")
+        target = station or (self.radios.get(phy) or {}).get("original_iface") or ""
+        convert_err = ""
+        if target and iface_exists(target):
+            if self._iface_type(target) == "monitor":
+                run(["ip", "link", "set", target, "up"])
+                run(["ip", "addr", "flush", "dev", target])
+                self._remember_original(phy, target)
+                return target, (target if steal and radio.get("uplink") else None), None
+            convert_err = self._convert_to_monitor(target) or ""
+            if not convert_err:
+                self._remember_original(phy, target)
+                return target, (target if steal and radio.get("uplink") else None), None
+            if not lab:
+                return "", None, convert_err
+
+        if steal and radio.get("uplink") and not (target and iface_exists(target)):
+            return "", None, f"no station iface to convert on {phy}"
+
+        name = f"{RLAB_PREFIX}{index}"
+        if iface_exists(name):
+            name = f"{RLAB_PREFIX}{index}m"
+        code, _out, err = run(["iw", "phy", phy, "interface", "add", name, "type", "monitor"])
+        if code != 0:
+            add_err = (err or _out).strip()
+            return "", None, convert_err or add_err or f"failed to add monitor iface on {phy}"
+        run(["nmcli", "device", "set", name, "managed", "no"])
+        up = run(["ip", "link", "set", name, "up"])
+        if up[0] != 0:
+            run(["iw", "dev", name, "del"])
+            return "", None, (up[2] or up[1] or "failed to bring monitor iface up").strip()
+        if target and iface_exists(target) and target != name:
+            self._unmanage_iface(target)
+            self._delete_iface(target)
+            self._remember_original(phy, target)
+        return name, None, None
+
+    def _leave_lab_mode(self, phy: str, idle_up: bool = True, connect_uplink: bool = False) -> str:
+        radio_state = dict(self.radios.get(phy) or {})
+        iface = str(radio_state.get("monitor_iface") or "")
+        if (radio_state.get("role") == "active"):
+            self.active_scan_stop({"phy": phy})
+        self._stop_scan(phy)
+        if iface:
+            self._stop_capture(iface)
+            self._stop_sniffer(iface)
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) or {}
+        converted = radio_state.get("converted_iface") or radio.get("converted_iface") or ""
+        stolen = radio_state.get("stolen_iface") or radio.get("stolen_iface") or ""
+        silenced = radio_state.get("silenced_iface") or ""
+        original = (
+            converted or stolen or silenced
+            or radio_state.get("original_iface") or radio.get("original_iface")
+            or radio.get("station_iface") or ""
+        )
+        if original.startswith(RLAB_PREFIX):
+            original = ""
+
+        err = ""
+        if iface and iface.startswith(RLAB_PREFIX):
+            self._delete_iface(iface)
+            if original and not iface_exists(original):
+                run(["iw", "phy", phy, "interface", "add", original, "type", "managed"])
+            target = original
+        elif iface:
+            target = iface
+            err = self._convert_to_managed(iface, up=False)
+        else:
+            target = original
+            if target and self._iface_type(target) == "monitor":
+                err = self._convert_to_managed(target, up=False)
+
+        if target and iface_exists(target):
+            run(["ip", "addr", "flush", "dev", target])
+            if connect_uplink and radio.get("uplink"):
+                join = self._remanage_iface(target, connect=True)
+                err = err or join
+            elif idle_up:
+                if not radio.get("uplink"):
+                    self._unmanage_iface(target)
+                run(["ip", "link", "set", target, "up"])
+            else:
+                if not radio.get("uplink"):
+                    self._unmanage_iface(target)
+                self._down_flush(target)
+
+        with self.lock:
+            state = self._radio(phy)
+            state["role"] = "station"
+            state["monitor_iface"] = ""
+            state["stolen_iface"] = ""
+            state["silenced_iface"] = ""
+            if original:
+                state["converted_iface"] = original
+                state["original_iface"] = original
+            state["capturing"] = False
+            state["capture_path"] = ""
+            state["hop_channels"] = []
+            state["note"] = ""
+            state["error"] = err
+        return err
+
+    def monitor_off(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        iface = str(req.get("iface") or (self.radios.get(phy) or {}).get("monitor_iface") or "")
+        if not phy:
+            phy = self.phy_of_iface(iface) or ""
+        if not phy:
+            return {"ok": False, "error": "phy or iface is required"}
+        if (self.radios.get(phy) or {}).get("role") == "active":
+            return self.active_scan_stop(req)
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) or {}
+        err = self._leave_lab_mode(phy, idle_up=True, connect_uplink=bool(radio.get("uplink")))
+        if err:
+            self._note_error(phy, err)
+            return {"ok": False, "error": err, "data": self.snapshot()}
+        return {"ok": True, "data": self.snapshot()}
+
+    def restore(self, req: dict) -> dict:
+        return self.monitor_off(req)
+
+    def _iface_type(self, iface: str) -> str:
+        code, out, _ = run(["iw", "dev", iface, "info"], timeout=4)
+        if code != 0:
+            return ""
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("type "):
+                return stripped.split()[1]
+        return ""
+
+    def _nm_wifi_state(self, iface: str) -> str:
+        code, out, _ = run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"])
+        if code != 0:
+            return ""
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[0] == iface:
+                return parts[1]
+        return ""
+
+    def _allow_nm_on_lab_radios(self) -> None:
+        path = Path("/etc/NetworkManager/conf.d/99-radio-lab-mt7921.conf")
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            run(["nmcli", "general", "reload"])
+
+    def _wait_nm_available(self, iface: str, timeout: float = 10.0) -> str:
+        deadline = time.time() + timeout
+        last = ""
+        while time.time() < deadline:
+            last = self._nm_wifi_state(iface)
+            if last in ("connected", "disconnected", "connecting", "disconnecting"):
+                return last
+            run(["nmcli", "device", "set", iface, "managed", "yes"])
+            run(["ip", "link", "set", iface, "up"])
+            time.sleep(0.4)
+        return last
+
+    def _remanage_iface(self, iface: str, connect: bool = True) -> str:
+        if not iface or iface.startswith(RLAB_PREFIX):
+            return ""
+        kind = self._iface_type(iface)
+        if kind and kind != "managed":
+            run(["ip", "link", "set", iface, "down"])
+            conv = run(["iw", "dev", iface, "set", "type", "managed"])
+            if conv[0] != 0:
+                return (conv[2] or conv[1] or f"could not restore {iface}").strip()
+        run(["nmcli", "device", "set", iface, "managed", "yes"])
+        run(["ip", "link", "set", iface, "up"])
+        self._wait_nm_available(iface)
+        if not connect:
+            return ""
+        if self._nm_wifi_state(iface) == "connected":
+            return ""
+        last = ""
+        for _attempt in range(2):
+            code, out, err = run(["nmcli", "-w", "20", "device", "connect", iface], timeout=25)
+            if code == 0 and self._nm_wifi_state(iface) == "connected":
+                return ""
+            last = (err or out).strip()
+            if "not available" in last.lower():
+                self._wait_nm_available(iface)
+                continue
+            break
+        code, listing, _ = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show"])
+        profiles = []
+        if code == 0:
+            for line in listing.splitlines():
+                parts = line.split(":")
+                if len(parts) < 3 or parts[2] != "802-11-wireless":
+                    continue
+                name, uuid, dev = parts[0], parts[1], parts[3] if len(parts) > 3 else ""
+                profiles.append((0 if dev == iface else 1, name, uuid))
+            profiles.sort()
+        for _rank, name, uuid in profiles:
+            err_text = self._up_wifi_profile(name, uuid, iface)
+            if self._nm_wifi_state(iface) == "connected":
+                return ""
+            last = err_text or last
+            if "not available" in (err_text or "").lower():
+                self._wait_nm_available(iface)
+                err_text = self._up_wifi_profile(name, uuid, iface)
+                if self._nm_wifi_state(iface) == "connected":
+                    return ""
+                last = err_text or last
+        if self._nm_wifi_state(iface) == "connected":
+            return ""
+        return last or f"could not associate {iface}"
+
+    def _up_wifi_profile(self, name: str, uuid: str, iface: str) -> str:
+        code, bound, _ = run(["nmcli", "-g", "connection.interface-name", "connection", "show", uuid])
+        bound_name = (bound or "").strip()
+        target = name
+        if bound_name and bound_name != iface:
+            clone = f"{name} on {iface}"
+            run(["nmcli", "connection", "delete", clone])
+            cloned = run(["nmcli", "connection", "clone", uuid, clone])
+            if cloned[0] != 0:
+                return (cloned[2] or cloned[1] or f"could not clone {name} for {iface}").strip()
+            run(["nmcli", "connection", "modify", clone, "connection.interface-name", iface])
+            target = clone
+        code, out, err = run(["nmcli", "-w", "20", "connection", "up", target, "ifname", iface], timeout=25)
+        if code == 0:
+            return ""
+        return (err or out).strip()
+
+    def _station_name(self, radio: dict) -> str:
+        for key in ("station_iface", "converted_iface", "original_iface", "stolen_iface", "silenced_iface"):
+            name = radio.get(key) or ""
+            if name and not name.startswith(RLAB_PREFIX):
+                return name
+        phy = radio.get("phy") or ""
+        extra = (self.radios.get(phy) or {}) if phy else {}
+        for key in ("converted_iface", "original_iface", "stolen_iface", "silenced_iface"):
+            name = extra.get(key) or ""
+            if name and not name.startswith(RLAB_PREFIX):
+                return name
+        for item in radio.get("ifaces") or []:
+            name = item.get("iface") or ""
+            if name and not name.startswith(RLAB_PREFIX):
+                return name
+        return ""
+
+    def _restore_one_radio(self, radio: dict) -> str:
+        phy = radio.get("phy") or ""
+        self._leave_lab_mode(phy, idle_up=True, connect_uplink=False)
+        with self.lock:
+            state = self._radio(phy)
+            state["disabled"] = False
+            state["role"] = "station"
+            state["error"] = ""
+        merged = dict(radio)
+        merged.update(self.radios.get(phy) or {})
+        iface = self._station_name(merged)
+        if not iface or not iface_exists(iface):
+            return f"no station interface on {phy}"
+        return self._remanage_iface(iface, connect=True)
+
+    def restore_wifi(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        inventory = collect_inventory({"radios": self.radios})
+        targets = [r for r in inventory["radios"] if not phy or r.get("phy") == phy]
+        if phy and not targets:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        if any(r.get("lab") or r.get("bus") == "usb" for r in targets):
+            self._allow_nm_on_lab_radios()
+        errors = []
+        for radio in targets:
+            err = self._restore_one_radio(radio)
+            if err:
+                errors.append(f"{radio.get('product') or radio.get('phy')}: {err}")
+                with self.lock:
+                    self._radio(radio.get("phy") or "")["error"] = err
+        snap = self.snapshot()
+        if errors:
+            snap["ok"] = False
+            snap["error"] = "; ".join(errors)
+            return {"ok": False, "error": snap["error"], "data": snap}
+        snap["restored"] = [r.get("phy") for r in targets]
+        return {"ok": True, "data": snap}
+
+    def disable_radio(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        if not phy:
+            return {"ok": False, "error": "phy is required"}
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if radio is None:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        err = self._leave_lab_mode(phy, idle_up=False, connect_uplink=False)
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) or radio
+        names = []
+        for item in radio.get("ifaces") or []:
+            name = item.get("iface") or ""
+            if name:
+                names.append(name)
+        target = self._station_name(radio) or (self.radios.get(phy) or {}).get("original_iface") or ""
+        if target:
+            names.append(target)
+        seen = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            self._unmanage_iface(name)
+            self._down_flush(name)
+        with self.lock:
+            state = self._radio(phy)
+            state["disabled"] = True
+            state["role"] = "station"
+            state["monitor_iface"] = ""
+            state["capturing"] = False
+            state["hop_channels"] = []
+            state["error"] = err
+            state["note"] = "disabled"
+        if err:
+            return {"ok": False, "error": err, "data": self.snapshot()}
+        return {"ok": True, "data": self.snapshot()}
+
+    def enable_radio(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        if not phy:
+            return {"ok": False, "error": "phy is required"}
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if radio is None:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        merged = dict(radio)
+        merged.update(self.radios.get(phy) or {})
+        iface = self._station_name(merged)
+        if iface and self._iface_type(iface) == "monitor":
+            err = self._convert_to_managed(iface, up=True)
+        elif iface and iface_exists(iface):
+            run(["ip", "link", "set", iface, "up"])
+            err = ""
+        elif iface:
+            add = run(["iw", "phy", phy, "interface", "add", iface, "type", "managed"])
+            if add[0] != 0:
+                err = (add[2] or add[1] or f"could not recreate {iface}").strip()
+            else:
+                run(["ip", "link", "set", iface, "up"])
+                err = ""
+        else:
+            err = f"no station interface on {phy}"
+        with self.lock:
+            state = self._radio(phy)
+            state["disabled"] = False
+            state["role"] = "station"
+            state["error"] = err
+            state["note"] = ""
+        if err:
+            return {"ok": False, "error": err, "data": self.snapshot()}
+        return {"ok": True, "data": self.snapshot()}
+
+    def _silence_station(self, phy: str) -> None:
+        """Hold NM off a lab phy. Never touch the PCIe internet radio."""
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if not radio or radio.get("uplink"):
+            return
+        for item in radio.get("ifaces") or []:
+            name = item.get("iface") or ""
+            if not name or item.get("type") == "monitor" or name.startswith(RLAB_PREFIX):
+                continue
+            if item.get("type") in ("managed", "AP", "P2P-client", "P2P-GO", ""):
+                self._unmanage_iface(name)
+                self._down_flush(name)
+                with self.lock:
+                    self._radio(phy)["silenced_iface"] = name
+
+    def _tune(self, iface: str, channel: int, width: int, band: str, mhz: int | None) -> tuple[int, int, str]:
+        freq = int(mhz or freq_of_channel(channel, band) or 0)
+        if freq <= 0:
+            return 2, width, f"cannot map channel {channel} on {band or 'unknown'} band to a frequency"
+        attempts = tune_commands(iface, channel, width, band, freq)
+        last = "failed to set frequency"
+        # Tune while UP. Taking monitor down on mt7921u stops 2.4 GHz RX until a full reset.
+        run(["ip", "link", "set", iface, "up"], timeout=3)
+
+        def try_all() -> tuple[int, int, str] | None:
+            nonlocal last
+            for cmd, used_width in attempts:
+                code, out, err = run(cmd, timeout=3)
+                if code == 0:
+                    return 0, used_width, ""
+                last = (err or out).strip() or last
+            return None
+
+        hit = try_all()
+        if hit:
+            return hit
+        run(["ip", "link", "set", iface, "down"], timeout=3)
+        run(["ip", "link", "set", iface, "up"], timeout=3)
+        hit = try_all()
+        if hit:
+            return hit
+        return 1, width, last
+
+    def set_channel(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        iface = str(req.get("iface") or "")
+        channel = int(req.get("channel") or 0)
+        width = int(req.get("width") or 20)
+        mhz = int(req.get("freq") or req.get("mhz") or 0)
+        band = infer_band(channel, str(req.get("band") or ""), mhz or None)
+        if not iface and phy:
+            iface = (self.radios.get(phy) or {}).get("monitor_iface") or ""
+        if phy:
+            inventory = collect_inventory({"radios": self.radios})
+            radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+            if radio and not radio.get("passive_monitor"):
+                return self.active_scan_start(req)
+        if not iface:
+            return {"ok": False, "error": "monitor iface is required"}
+        if channel <= 0 and not mhz:
+            return {"ok": False, "error": "channel is required"}
+        if not phy:
+            phy = self.phy_of_iface(iface) or ""
+        if phy:
+            self._stop_scan(phy)
+            self._silence_station(phy)
+        with self.tune_lock:
+            code, width, message = self._tune(iface, channel, width, band, mhz or None)
+            if code != 0:
+                if phy:
+                    self._note_error(phy, message)
+                return {"ok": False, "error": message}
+            self.ensure_sniffer(iface)
+            with self.lock:
+                if phy:
+                    state = self._radio(phy)
+                    state["channel"] = channel
+                    state["width"] = width
+                    state["band"] = band
+                    state["freq"] = mhz or freq_of_channel(channel, band) or 0
+                    state["error"] = ""
+                    if band and width:
+                        learned = dict(state.get("learned_width") or {})
+                        prev = int(learned.get(band) or 0)
+                        if width > prev:
+                            learned[band] = width
+                            state["learned_width"] = learned
+                    state["role"] = "monitor"
+                    state["hop_channels"] = []
+        return {"ok": True, "data": self.snapshot()}
+
+    def hop_start(self, req: dict) -> dict:
+        return self.scan_start(req)
+
+    def scan_start(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        channels = req.get("channels") or []
+        if isinstance(channels, str):
+            channels = [int(x) for x in re.split(r"[,\s]+", channels) if x]
+        channels = [int(c) for c in channels if int(c) > 0]
+        band = str(req.get("band") or "")
+        if not phy:
+            return {"ok": False, "error": "phy is required"}
+        if not channels:
+            return {"ok": False, "error": "need channels to scan"}
+        if not band:
+            band = infer_band(channels[0], str(req.get("band") or ""), None)
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if radio is None:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        self._stop_scan(phy)
+        if (self.radios.get(phy) or {}).get("monitor_iface") or radio.get("role") in ("monitor", "hopper"):
+            self._leave_lab_mode(phy, idle_up=True, connect_uplink=False)
+            inventory = collect_inventory({"radios": self.radios})
+            radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) or radio
+        iface = radio.get("station_iface") or self._station_name(radio) or ""
+        if not iface:
+            return {"ok": False, "error": f"no station interface on {phy} for scan"}
+        if radio.get("lab") or radio.get("bus") == "usb":
+            self._unmanage_iface(iface)
+            run(["ip", "link", "set", iface, "up"], timeout=3)
+        freqs: list[int] = []
+        seen: set[int] = set()
+        for ch in channels:
+            freq = freq_of_channel(ch, band)
+            if freq and freq not in seen:
+                seen.add(freq)
+                freqs.append(int(freq))
+        if not freqs:
+            return {"ok": False, "error": f"cannot map {band or 'unknown'} GHz channels to frequencies"}
+        timeout = min(25.0, max(12.0, 0.4 * len(freqs) + 6))
+        stop = threading.Event()
+        self.scanners[phy] = stop
+        note = f"Scanning {band} GHz"
+        if band in ("5", "6"):
+            note += " (passive on DFS / no-IR)"
+        with self.lock:
+            state = self._radio(phy)
+            state["role"] = "hopper"
+            state["channel"] = channels[0]
+            state["band"] = band
+            state["hop_band"] = band
+            state["freq"] = freqs[0]
+            state["width"] = 20
+            state["hop_channels"] = channels
+            state["dwell_ms"] = int(timeout * 1000)
+            state["monitor_iface"] = ""
+            state["error"] = ""
+            state["note"] = note
+
+        def loop() -> None:
+            cmd = ["iw", "dev", iface, "scan", "freq"] + [str(f) for f in freqs]
+            while not stop.is_set() and not self.stop.is_set():
+                code, out, err = run(cmd, timeout=timeout)
+                aps = parse_scan_dump(out) if code == 0 else []
+                with self.lock:
+                    st = self._radio(phy)
+                    st["last_scan"] = len(aps)
+                    st["band"] = band
+                    st["hop_band"] = band
+                    if code != 0:
+                        st["error"] = (err or out).strip()[:160]
+                    else:
+                        st["error"] = ""
+                for ap in aps:
+                    self.ingest(iface, {
+                        "kind": "ap",
+                        "bssid": ap.get("bssid") or "",
+                        "ssid": ap.get("ssid") or "",
+                        "hidden": not ap.get("ssid"),
+                        "channel": ap.get("channel") or channel_of_freq(ap.get("freq")) or 0,
+                        "freq": ap.get("freq") or 0,
+                        "band": ap.get("band") or band_of_freq(ap.get("freq")) or band,
+                        "rssi": ap.get("rssi"),
+                        "security": ap.get("security") or "",
+                        "ht": False,
+                        "vht": False,
+                        "he": False,
+                        "width": ap.get("width") or 20,
+                    })
+                self._log_scan_aps(phy, iface, aps, {"band": band, "channels": channels})
+                stop.wait(0.5)
+
+        threading.Thread(target=loop, name=f"scan-{phy}", daemon=True).start()
+        return {"ok": True, "data": self.snapshot()}
+
+    def hop_stop(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        self._stop_scan(phy)
+        with self.lock:
+            if phy in self.radios:
+                self.radios[phy]["role"] = "monitor" if self.radios[phy].get("monitor_iface") else "station"
+                self.radios[phy]["hop_channels"] = []
+                self.radios[phy]["hop_band"] = ""
+                self.radios[phy]["note"] = ""
+        return {"ok": True, "data": self.snapshot()}
+
+    def _log_scan_aps(self, phy: str, iface: str, aps: list[dict], extra: dict) -> None:
+        """Write one active-scan survey row and, if capturing, reconstructed beacons."""
+        row = {"ts": utc_now(), "phy": phy, "iface": iface, "source": "iw-scan", **extra, "aps": aps}
+        survey = self.surveys.get(phy)
+        if survey is not None:
+            try:
+                survey.write(row)
+            except OSError:
+                pass
+        writer = self.writers.get(iface)
+        if writer is None or writer.kind != "survey":
+            return
+        seq = int((self.radios.get(phy) or {}).get("survey_seq") or 0)
+        for ap in aps:
+            if not ap.get("bssid"):
+                continue
+            try:
+                writer.write(build_survey_frame(ap, seq))
+            except OSError:
+                break
+            seq += 1
+        with self.lock:
+            self._radio(phy)["survey_seq"] = seq
+
+    def _stop_scan(self, phy: str) -> None:
+        event = self.scanners.pop(phy, None)
+        if event:
+            event.set()
+
+    def _drop_fake_monitor(self, radio: dict) -> None:
+        mon = radio.get("monitor_iface") or ""
+        if mon and mon.startswith(RLAB_PREFIX):
+            self._stop_sniffer(mon)
+            run(["ip", "link", "set", mon, "down"])
+            run(["iw", "dev", mon, "del"])
+
+    def active_scan_start(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        if not phy:
+            return {"ok": False, "error": "phy is required"}
+        channel = int(req.get("channel") or 0)
+        band = infer_band(channel, str(req.get("band") or ""), req.get("freq") or None)
+        mhz = int(req.get("freq") or req.get("mhz") or 0) or (freq_of_channel(channel, band) or 0)
+        channels = req.get("channels") or []
+        if isinstance(channels, str):
+            channels = [int(x) for x in re.split(r"[,\s]+", channels) if x]
+        channels = [int(c) for c in channels if int(c) > 0]
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
+        if radio is None:
+            return {"ok": False, "error": f"unknown phy {phy}"}
+        iface = radio.get("station_iface") or self._station_name(radio) or ""
+        if not iface:
+            return {"ok": False, "error": f"no station interface on {phy} for active scan"}
+        if radio.get("lab") or radio.get("bus") == "usb":
+            self._unmanage_iface(iface)
+            run(["ip", "link", "set", iface, "up"], timeout=3)
+        if not channel and channels:
+            channel = channels[0]
+            mhz = freq_of_channel(channel, band) or mhz
+        if not channel and not mhz:
+            channel = 6 if "2.4" in (radio.get("bands") or []) else 36
+            band = "2.4" if channel <= 14 else "5"
+            mhz = freq_of_channel(channel, band) or 0
+        self._drop_fake_monitor(radio)
+        self._stop_scan(phy)
+        stop = threading.Event()
+        self.scanners[phy] = stop
+        hopping = len(channels) >= 2
+        with self.lock:
+            state = self._radio(phy)
+            state["role"] = "active"
+            state["channel"] = channel
+            state["band"] = band
+            state["freq"] = mhz
+            state["width"] = 20
+            state["hop_channels"] = channels if hopping else []
+            state["dwell_ms"] = int(req.get("dwell_ms") or (1200 if hopping else 2500))
+            state["monitor_iface"] = ""
+            state["error"] = ""
+            state["note"] = "active scan (this NIC cannot passive-monitor a parked channel)"
+
+        wait_s = max(1.2, float(self.radios.get(phy, {}).get("dwell_ms") or 1200) / 1000.0)
+
+        def loop() -> None:
+            idx = 0
+            seq = channels if hopping else [channel]
+            while not stop.is_set() and not self.stop.is_set():
+                ch = seq[idx % len(seq)]
+                use_band = band or infer_band(ch, band, None)
+                freq = freq_of_channel(ch, use_band) or 0
+                if freq:
+                    code, out, err = run(
+                        ["iw", "dev", iface, "scan", "freq", str(int(freq))],
+                        timeout=8,
+                    )
+                    aps = parse_scan_dump(out) if code == 0 else []
+                    with self.lock:
+                        st = self._radio(phy)
+                        st["channel"] = ch
+                        st["band"] = use_band
+                        st["freq"] = freq
+                        st["last_scan"] = len(aps)
+                        if code != 0:
+                            st["error"] = (err or out).strip()[:160]
+                        else:
+                            st["error"] = ""
+                    for ap in aps:
+                        self.ingest(iface, {
+                            "kind": "ap",
+                            "bssid": ap.get("bssid") or "",
+                            "ssid": ap.get("ssid") or "",
+                            "hidden": not ap.get("ssid"),
+                            "channel": ap.get("channel") or ch,
+                            "freq": ap.get("freq") or freq,
+                            "band": band_of_freq(ap.get("freq") or freq),
+                            "rssi": ap.get("rssi"),
+                            "security": ap.get("security") or "",
+                            "ht": False,
+                            "vht": False,
+                            "he": False,
+                            "width": ap.get("width") or 20,
+                        })
+                    self._log_scan_aps(phy, iface, aps, {
+                        "channel": ch,
+                        "freq": freq,
+                        "band": use_band,
+                    })
+                idx += 1
+                stop.wait(wait_s)
+
+        threading.Thread(target=loop, name=f"ascan-{phy}", daemon=True).start()
+        return {"ok": True, "data": self.snapshot()}
+
+    def active_scan_stop(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        self._stop_scan(phy)
+        with self.lock:
+            if phy in self.radios:
+                self.radios[phy]["role"] = "station"
+                self.radios[phy]["hop_channels"] = []
+                self.radios[phy]["note"] = ""
+        return {"ok": True, "data": self.snapshot()}
+
+    def capture_start(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        inventory = collect_inventory({"radios": self.radios})
+        radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) if phy else None
+        if radio and not radio.get("passive_monitor"):
+            if (self.radios.get(phy) or {}).get("role") != "active":
+                armed = self.active_scan_start(req)
+                if not armed.get("ok"):
+                    return armed
+            iface = radio.get("station_iface") or ""
+            if not iface:
+                return {"ok": False, "error": "no station interface for active capture"}
+            state = self.radios.get(phy) or {}
+            channel = int(req.get("channel") or state.get("channel") or 0)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            band = str(req.get("band") or state.get("band") or "scan")
+            base = f"{stamp}_{phy}_{iface}_active-ch{channel or 'x'}_{band}"
+            jsonl = self.capture_dir / f"{base}.jsonl"
+            survey = SurveyLog(jsonl)
+            try:
+                os.chown(jsonl, self.allow_uid, -1)
+            except OSError:
+                pass
+            self.surveys[phy] = survey
+            path = self.capture_dir / f"{base}.pcap"
+            if iface not in self.writers:
+                writer = PcapWriter(path, dlt=DLT_IEEE802_11_RADIO, kind="survey")
+                try:
+                    os.chown(path, self.allow_uid, -1)
+                except OSError:
+                    pass
+                self.writers[iface] = writer
+            with self.lock:
+                st = self._radio(phy)
+                st["capturing"] = True
+                st["capture_iface"] = iface
+                st["station_iface"] = iface
+                st["capture_path"] = str(path)
+                st["survey_seq"] = 0
+                st["note"] = "active-scan survey (this NIC cannot park a radiotap listen)"
+            return {"ok": True, "data": self.snapshot()}
+        iface = str(req.get("iface") or (self.radios.get(phy) or {}).get("monitor_iface") or "")
+        if not iface:
+            if not phy:
+                return {"ok": False, "error": "phy or iface is required"}
+            armed = self.monitor_on(req)
+            if not armed.get("ok"):
+                return armed
+            iface = (self.radios.get(phy) or {}).get("monitor_iface") or ""
+        if not iface:
+            return {"ok": False, "error": "no monitor iface to capture"}
+        if not phy:
+            phy = self.phy_of_iface(iface) or "phy"
+        if iface in self.writers:
+            return {"ok": True, "data": self.snapshot()}
+        state = self.radios.get(phy) or {}
+        channel = int(req.get("channel") or state.get("channel") or 0)
+        hopping = bool(state.get("hop_channels"))
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        ch_part = "hop" if hopping else f"ch{channel or 'x'}"
+        name = f"{stamp}_{phy}_{iface}_{ch_part}.pcap"
+        path = self.capture_dir / name
+        writer = PcapWriter(path, dlt=iface_pcap_dlt(iface), kind="live")
+        try:
+            os.chown(path, self.allow_uid, -1)
+        except OSError:
+            pass
+        self.writers[iface] = writer
+        self.ensure_sniffer(iface)
+        with self.lock:
+            radio = self._radio(phy)
+            radio["capturing"] = True
+            radio["capture_iface"] = iface
+            radio["capture_path"] = str(path)
+        return {"ok": True, "data": self.snapshot()}
+
+    def capture_stop(self, req: dict) -> dict:
+        phy = str(req.get("phy") or "")
+        survey = self.surveys.pop(phy, None)
+        if survey:
+            survey.close()
+        state = self.radios.get(phy) or {}
+        inventory = collect_inventory({"radios": self.radios})
+        live = next((r for r in inventory["radios"] if r["phy"] == phy), None) or {}
+        ifaces = [
+            req.get("iface"),
+            state.get("capture_iface"),
+            state.get("monitor_iface"),
+            state.get("station_iface"),
+            live.get("monitor_iface"),
+            live.get("station_iface"),
+        ]
+        seen: set[str] = set()
+        for iface in ifaces:
+            name = str(iface or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            self._stop_capture(name)
+        if phy:
+            with self.lock:
+                if phy in self.radios:
+                    self.radios[phy]["capturing"] = False
+                    self.radios[phy]["capture_iface"] = ""
+        return {"ok": True, "data": self.snapshot()}
+
+    def _stop_capture(self, iface: str) -> None:
+        writer = self.writers.pop(iface, None)
+        if writer:
+            writer.close()
+
+    def survey(self, req: dict) -> dict:
+        iface = str(req.get("iface") or "")
+        if not iface:
+            return {"ok": False, "error": "iface is required"}
+        run(["iw", "dev", iface, "scan", "trigger"])
+        time.sleep(1.2)
+        code, out, err = run(["iw", "dev", iface, "scan", "dump"], timeout=12)
+        if code != 0:
+            return {"ok": False, "error": (err or out).strip()}
+        aps = parse_scan_dump(out)
+        return {"ok": True, "data": {"aps": aps}}
+
+    def ensure_sniffer(self, iface: str) -> None:
+        if not iface or iface in self.sniffers:
+            return
+        stop = threading.Event()
+        self.sniffers[iface] = stop
+
+        def open_sock():
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            sock.bind((iface, 0))
+            sock.settimeout(0.4)
+            return sock
+
+        def sock_dlt(sock: socket.socket) -> int:
+            try:
+                name = sock.getsockname()
+                hatype = name[3] if isinstance(name, tuple) and len(name) >= 4 else iface_arphrd(iface)
+            except OSError:
+                hatype = iface_arphrd(iface)
+            return ARPHRD_TO_DLT.get(int(hatype or 0), 0)
+
+        def loop() -> None:
+            sock = None
+            try:
+                sock = open_sock()
+            except OSError:
+                self.sniffers.pop(iface, None)
+                return
+            dlt = sock_dlt(sock)
+            try:
+                while not stop.is_set() and not self.stop.is_set():
+                    try:
+                        packet = sock.recv(SNAPLEN)
+                    except TimeoutError:
+                        continue
+                    except OSError:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        time.sleep(0.12)
+                        try:
+                            sock = open_sock()
+                        except OSError:
+                            break
+                        dlt = sock_dlt(sock)
+                        continue
+                    if not packet:
+                        continue
+                    writer = self.writers.get(iface)
+                    if writer and writer.kind == "live" and writer.dlt == dlt:
+                        writer.write(packet)
+                    if dlt != DLT_IEEE802_11_RADIO:
+                        continue
+                    rt = parse_radiotap(packet)
+                    if not rt:
+                        continue
+                    frame = packet[rt["length"]:]
+                    parsed = parse_mgmt_frame(frame, rt)
+                    if parsed:
+                        self.ingest(iface, parsed)
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self.sniffers.pop(iface, None)
+
+        threading.Thread(target=loop, name=f"sniff-{iface}", daemon=True).start()
+
+    def _stop_sniffer(self, iface: str) -> None:
+        event = self.sniffers.pop(iface, None)
+        if event:
+            event.set()
+
+    def ingest(self, iface: str, parsed: dict) -> None:
+        now = time.time()
+        with self.lock:
+            if parsed["kind"] == "ap":
+                key = parsed["bssid"]
+                prev = self.air.get(key) or {}
+                rssi = parsed.get("rssi")
+                if rssi is None:
+                    rssi = prev.get("rssi")
+                elif prev.get("rssi") is not None:
+                    rssi = round((prev["rssi"] * 0.6) + (rssi * 0.4), 1)
+                entry = {
+                    "bssid": key,
+                    "ssid": parsed.get("ssid") if parsed.get("ssid") not in (None, "") else prev.get("ssid") or "",
+                    "hidden": bool(parsed.get("hidden") and not (parsed.get("ssid") or prev.get("ssid"))),
+                    "channel": parsed.get("channel") or prev.get("channel") or 0,
+                    "freq": parsed.get("freq") or prev.get("freq") or 0,
+                    "band": parsed.get("band") or prev.get("band") or "",
+                    "rssi": rssi,
+                    "security": parsed.get("security") or prev.get("security") or "",
+                    "ht": parsed.get("ht") or prev.get("ht"),
+                    "vht": parsed.get("vht") or prev.get("vht"),
+                    "he": parsed.get("he") or prev.get("he"),
+                    "width": _clamp_bss_width(
+                        _prefer_width(parsed.get("width"), prev.get("width")),
+                        parsed.get("band") or prev.get("band") or band_of_freq(parsed.get("freq") or prev.get("freq")),
+                    ),
+                    "iface": iface,
+                    "last_seen": int(now),
+                    "beacons": int(prev.get("beacons") or 0) + 1,
+                }
+                if key in self.air:
+                    self.air.move_to_end(key)
+                self.air[key] = entry
+                while len(self.air) > MAX_AIR:
+                    self.air.popitem(last=False)
+            elif parsed["kind"] == "probe":
+                key = parsed["client"]
+                prev = self.clients.get(key) or {}
+                seen = list(prev.get("ssids") or [])
+                ssid = parsed.get("ssid") or ""
+                if ssid and ssid not in seen:
+                    seen = (seen + [ssid])[-8:]
+                entry = {
+                    "client": key,
+                    "ssids": seen,
+                    "rssi": parsed.get("rssi") if parsed.get("rssi") is not None else prev.get("rssi"),
+                    "band": parsed.get("band") or prev.get("band") or "",
+                    "iface": iface,
+                    "last_seen": int(now),
+                    "probes": int(prev.get("probes") or 0) + 1,
+                }
+                if key in self.clients:
+                    self.clients.move_to_end(key)
+                self.clients[key] = entry
+                while len(self.clients) > MAX_CLIENTS:
+                    self.clients.popitem(last=False)
+
+    def serve(self) -> int:
+        if os.path.exists(self.sock_path):
+            try:
+                os.remove(self.sock_path)
+            except OSError:
+                pass
+        Path(self.sock_path).parent.mkdir(parents=True, exist_ok=True)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(self.sock_path)
+        os.chmod(self.sock_path, 0o666)
+        sock.listen(16)
+        sock.settimeout(0.5)
+        self.adopt()
+        self.persist_status()
+
+        def status_loop() -> None:
+            while not self.stop.is_set():
+                self.persist_status()
+                self.stop.wait(1.2)
+
+        threading.Thread(target=status_loop, name="status", daemon=True).start()
+
+        def handle_client(conn: socket.socket) -> None:
+            try:
+                creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                pid, uid, gid = struct.unpack("3i", creds)
+                if uid not in (0, self.allow_uid):
+                    conn.sendall(b'{"ok":false,"error":"forbidden"}\n')
+                    return
+                data = b""
+                while b"\n" not in data:
+                    chunk = conn.recv(1 << 16)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if len(data) > 1 << 20:
+                        break
+                if not data:
+                    return
+                req = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+                reply = self.handle(req)
+                conn.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except Exception as exc:
+                try:
+                    conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
+                except OSError:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        while not self.stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                if self.stop.is_set():
+                    break
+                continue
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return 0
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        for event in list(self.scanners.values()):
+            event.set()
+        for event in list(self.sniffers.values()):
+            event.set()
+        for writer in list(self.writers.values()):
+            writer.close()
+        self.writers.clear()
+        for survey in list(self.surveys.values()):
+            survey.close()
+        self.surveys.clear()
+
+
+_VHT_OP_WIDTH_LINE = re.compile(r"^\*\s+channel width:\s+(\d+)\s+\(([^)]+)\)\s*$", re.I)
+_VHT_CCFS_LINE = re.compile(r"^\*\s+center freq segment ([12]):\s+(\d+)\s*$", re.I)
+
+
+def _he6_width_from_label(text: str, ccfs0: int, ccfs1: int) -> int:
+    lower = text.lower()
+    if "320" in lower:
+        return 320
+    if "80+80" in lower or "160" in lower:
+        return _he6_operating_width(3, ccfs0, ccfs1)
+    if "80" in lower:
+        return 80
+    if "40" in lower:
+        return 40
+    if "20" in lower:
+        return 20
+    return 0
+
+
+def _finalize_scan_ap(
+    ap: dict,
+    ht40: bool,
+    vht_code: int | None,
+    ccfs0: int,
+    ccfs1: int,
+    he6_label: str,
+    he6_ccfs0: int,
+    he6_ccfs1: int,
+) -> None:
+    width = 40 if ht40 else 20
+    if vht_code is not None:
+        vw = _vht_operating_width(vht_code, ccfs0, ccfs1)
+        if vw:
+            width = vw
+    if he6_label:
+        hw = _he6_width_from_label(he6_label, he6_ccfs0, he6_ccfs1)
+        if hw:
+            width = hw
+    band = ap.get("band") or band_of_freq(ap.get("freq")) or ""
+    if band:
+        ap["band"] = band
+    ap["width"] = _clamp_bss_width(width, band)
+
+
+def parse_scan_dump(text: str) -> list[dict]:
+    aps: list[dict] = []
+    current: dict | None = None
+    ht40 = False
+    vht_code: int | None = None
+    ccfs0 = 0
+    ccfs1 = 0
+    he6_label = ""
+    he6_ccfs0 = 0
+    he6_ccfs1 = 0
+
+    def close_current() -> None:
+        if current is None:
+            return
+        _finalize_scan_ap(current, ht40, vht_code, ccfs0, ccfs1, he6_label, he6_ccfs0, he6_ccfs1)
+        aps.append(current)
+
+    for line in text.splitlines():
+        if line.startswith("BSS "):
+            close_current()
+            bssid = line.split()[1].split("(")[0]
+            current = {"bssid": mac_colon(bssid), "ssid": "", "freq": 0, "channel": 0, "rssi": None, "security": "", "width": 20}
+            ht40 = False
+            vht_code = None
+            ccfs0 = 0
+            ccfs1 = 0
+            he6_label = ""
+            he6_ccfs0 = 0
+            he6_ccfs1 = 0
+            continue
+        if current is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith("freq:"):
+            try:
+                current["freq"] = float(stripped.split(":", 1)[1].strip())
+                current["band"] = band_of_freq(current["freq"])
+                mapped = channel_of_freq(current["freq"])
+                if mapped and (not current.get("channel") or current["band"] == "6"):
+                    current["channel"] = mapped
+            except ValueError:
+                pass
+        elif stripped.startswith("signal:"):
+            try:
+                current["rssi"] = float(stripped.split()[1])
+            except (IndexError, ValueError):
+                pass
+        elif stripped.startswith("SSID:"):
+            current["ssid"] = stripped[5:].strip()
+        elif stripped.startswith("DS Parameter set: channel"):
+            try:
+                current["channel"] = int(stripped.split()[-1])
+            except ValueError:
+                pass
+        elif "RSN:" in stripped:
+            current["security"] = "WPA2/WPA3"
+        elif stripped.startswith("WPA:"):
+            current["security"] = current.get("security") or "WPA"
+        elif stripped.startswith("* secondary channel offset:") and ("above" in stripped.lower() or "below" in stripped.lower()):
+            ht40 = True
+        elif (m := _VHT_OP_WIDTH_LINE.match(stripped)):
+            try:
+                vht_code = int(m.group(1))
+            except ValueError:
+                pass
+        elif (m := _VHT_CCFS_LINE.match(stripped)):
+            try:
+                value = int(m.group(2))
+            except ValueError:
+                continue
+            if m.group(1) == "1":
+                ccfs0 = value
+            else:
+                ccfs1 = value
+        elif stripped.startswith("Channel Width:"):
+            he6_label = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("Center Frequency Segment 0:"):
+            try:
+                he6_ccfs0 = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif stripped.startswith("Center Frequency Segment 1:"):
+            try:
+                he6_ccfs1 = int(stripped.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+    close_current()
+    aps.sort(key=lambda a: (a.get("rssi") is None, -(a.get("rssi") or -999)))
+    return aps[:80]
+
+
+# ---------------------------------------------------------------------------
+# CLI / rpc
+# ---------------------------------------------------------------------------
+
+def rpc(cmd: str, payload: dict | None = None, sock_path: str = DEFAULT_SOCKET, timeout: float = 20.0) -> dict:
+    req = {"cmd": cmd, **(payload or {})}
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(sock_path)
+        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(1 << 16)
+            if not chunk:
+                break
+            data += chunk
+        if not data:
+            return {"ok": False, "error": "empty reply from helper"}
+        return json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+    except FileNotFoundError:
+        return {"ok": False, "error": "helper_not_running"}
+    except ConnectionRefusedError:
+        return {"ok": False, "error": "helper_not_running"}
+    except TimeoutError:
+        return {"ok": False, "error": "helper timed out"}
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (111, 2):
+            return {"ok": False, "error": "helper_not_running"}
+        return {"ok": False, "error": str(exc)}
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def helper_paths() -> dict:
+    installed = Path("/usr/local/lib/radio-lab/wnicd")
+    here = Path(__file__).resolve()
+    return {
+        "installed": str(installed) if installed.exists() else "",
+        "plugin": str(here),
+        "ctl": "/usr/local/bin/wnic-ctl" if Path("/usr/local/bin/wnic-ctl").exists() else str(here),
+        "service": Path("/etc/systemd/system/wnicd.service").exists(),
+    }
+
+
+def helper_state() -> str:
+    if socket_alive():
+        return "running"
+    if helper_paths()["installed"]:
+        return "stopped"
+    return "missing"
+
+
+def print_json(data: dict, pretty: bool) -> int:
+    if pretty:
+        json.dump(data, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    else:
+        json.dump(data, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+    return 0 if data.get("ok", True) else 1
+
+
+def cmd_status(pretty: bool) -> int:
+    if socket_alive():
+        reply = rpc("status")
+        if reply.get("ok") and "data" in reply:
+            return print_json(reply["data"], pretty)
+    extra = {
+        "helper": {
+            "state": helper_state(),
+            "socket": DEFAULT_SOCKET,
+            **helper_paths(),
+        },
+        "capture_dir": default_capture_dir(),
+    }
+    data = collect_inventory(extra)
+    return print_json(data, pretty)
+
+
+def need_helper(reply: dict) -> dict:
+    if reply.get("error") == "helper_not_running":
+        reply["hint"] = "Start the Radio Lab helper from the bar panel, or: pkexec systemctl start wnicd"
+    return reply
+
+
+def privileged(cmd: str, payload: dict, pretty: bool) -> int:
+    reply = need_helper(rpc(cmd, payload))
+    if "data" in reply and isinstance(reply["data"], dict) and pretty is False:
+        # Panel always wants the inventory snapshot when present.
+        body = reply["data"]
+        body["ok"] = reply.get("ok", False)
+        if not reply.get("ok"):
+            body["error"] = reply.get("error", "")
+        return print_json(body, pretty)
+    return print_json(reply, pretty)
+
+
+def daemonize() -> None:
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    sys.stdin.close()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    devnull = open("/dev/null", "wb", buffering=0)
+    os.dup2(devnull.fileno(), 1)
+    os.dup2(devnull.fileno(), 2)
+
+
+def run_daemon(allow_uid: int, capture_dir: str, sock_path: str, fork: bool) -> int:
+    if os.geteuid() != 0:
+        print("wnicd must run as root (pkexec or systemd)", file=sys.stderr)
+        return 2
+    if fork:
+        daemonize()
+    lab = RadioLab(allow_uid=allow_uid, capture_dir=capture_dir, sock_path=sock_path)
+
+    def handle_signal(_signum, _frame):
+        lab.shutdown()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    return lab.serve()
+
+
+def parse_channels(value: str | None) -> list[int]:
+    if not value:
+        return []
+    return [int(part) for part in re.split(r"[,\s]+", value) if part]
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    prog = Path(sys.argv[0]).name
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Radio Lab multi-WNIC helper",
+    )
+    pretty = "--pretty" in argv
+    argv = [arg for arg in argv if arg != "--pretty"]
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("status", help="list radios, helper, air, captures")
+    d = sub.add_parser("daemon", help="run privileged helper (root)")
+    d.add_argument("--allow-uid", type=int, default=int(os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID") or os.getuid()))
+    d.add_argument("--capture-dir", default="")
+    d.add_argument("--socket", default=DEFAULT_SOCKET)
+    d.add_argument("--foreground", action="store_true")
+    p = sub.add_parser("monitor-on")
+    p.add_argument("phy")
+    p.add_argument("--channel", type=int, default=0)
+    p.add_argument("--width", type=int, default=20)
+    p.add_argument("--band", default="")
+    p.add_argument("--freq", type=int, default=0)
+    p.add_argument("--steal", action="store_true")
+    p = sub.add_parser("monitor-off")
+    p.add_argument("phy")
+    p = sub.add_parser("set-channel")
+    p.add_argument("phy")
+    p.add_argument("channel", type=int)
+    p.add_argument("--width", type=int, default=20)
+    p.add_argument("--band", default="")
+    p.add_argument("--freq", type=int, default=0)
+    p = sub.add_parser("hop-start", help="alias for scan-start")
+    p.add_argument("phy")
+    p.add_argument("--channels", required=True)
+    p.add_argument("--band", default="")
+    p = sub.add_parser("hop-stop", help="alias for scan-stop")
+    p.add_argument("phy")
+    p = sub.add_parser("scan-start", help="scan the given band/channels into AIR (passive on 6 GHz / DFS)")
+    p.add_argument("phy")
+    p.add_argument("--channels", required=True)
+    p.add_argument("--band", default="")
+    p = sub.add_parser("scan-stop")
+    p.add_argument("phy")
+    p = sub.add_parser("capture-start")
+    p.add_argument("phy")
+    p.add_argument("--steal", action="store_true")
+    p.add_argument("--channel", type=int, default=0)
+    p.add_argument("--band", default="")
+    p = sub.add_parser("capture-stop")
+    p.add_argument("phy")
+    p = sub.add_parser("restore")
+    p.add_argument("phy")
+    p = sub.add_parser("restore-wifi", help="put one NIC (or all, if omitted) back to station and reconnect Wi-Fi")
+    p.add_argument("phy", nargs="?", default="")
+    p = sub.add_parser("disable", help="take a NIC down (no IP, not in monitor)")
+    p.add_argument("phy")
+    p = sub.add_parser("enable", help="bring a disabled NIC back up without joining Wi-Fi")
+    p.add_argument("phy")
+    p = sub.add_parser("active-scan-start")
+    p.add_argument("phy")
+    p.add_argument("--channel", type=int, default=0)
+    p.add_argument("--band", default="")
+    p.add_argument("--channels", default="")
+    p = sub.add_parser("active-scan-stop")
+    p.add_argument("phy")
+    p = sub.add_parser("survey")
+    p.add_argument("iface")
+    p = sub.add_parser("ping")
+
+    commands = {
+        "status", "daemon", "monitor-on", "monitor-off", "set-channel",
+        "hop-start", "hop-stop", "scan-start", "scan-stop",
+        "capture-start", "capture-stop", "restore",
+        "restore-wifi", "disable", "enable", "active-scan-start", "active-scan-stop",
+        "survey", "ping",
+    }
+    if not any(arg in commands for arg in argv):
+        argv = ["status", *argv]
+    args = parser.parse_args(argv)
+
+    if args.cmd == "status":
+        return cmd_status(pretty)
+    if args.cmd == "daemon":
+        uid = args.allow_uid
+        capture_dir = args.capture_dir or str(Path(uid_to_home(uid)) / "radio-lab" / "captures")
+        return run_daemon(uid, capture_dir, args.socket, fork=not args.foreground)
+    if args.cmd == "monitor-on":
+        return privileged("monitor_on", {"phy": args.phy, "channel": args.channel, "width": args.width, "steal": args.steal, "band": args.band, "freq": args.freq}, pretty)
+    if args.cmd == "monitor-off":
+        return privileged("monitor_off", {"phy": args.phy}, pretty)
+    if args.cmd == "set-channel":
+        return privileged("set_channel", {"phy": args.phy, "channel": args.channel, "width": args.width, "band": args.band, "freq": args.freq}, pretty)
+    if args.cmd == "hop-start":
+        return privileged("scan_start", {"phy": args.phy, "channels": parse_channels(args.channels), "band": args.band}, pretty)
+    if args.cmd == "hop-stop":
+        return privileged("hop_stop", {"phy": args.phy}, pretty)
+    if args.cmd == "scan-start":
+        return privileged("scan_start", {"phy": args.phy, "channels": parse_channels(args.channels), "band": args.band}, pretty)
+    if args.cmd == "scan-stop":
+        return privileged("hop_stop", {"phy": args.phy}, pretty)
+    if args.cmd == "capture-start":
+        payload = {"phy": args.phy, "steal": args.steal}
+        if args.channel:
+            payload["channel"] = args.channel
+        if args.band:
+            payload["band"] = args.band
+        return privileged("capture_start", payload, pretty)
+    if args.cmd == "capture-stop":
+        return privileged("capture_stop", {"phy": args.phy}, pretty)
+    if args.cmd == "restore":
+        return privileged("restore", {"phy": args.phy}, pretty)
+    if args.cmd == "restore-wifi":
+        return privileged("restore_wifi", {"phy": args.phy or ""}, pretty)
+    if args.cmd == "disable":
+        return privileged("disable", {"phy": args.phy}, pretty)
+    if args.cmd == "enable":
+        return privileged("enable", {"phy": args.phy}, pretty)
+    if args.cmd == "active-scan-start":
+        payload = {"phy": args.phy, "channel": args.channel, "band": args.band}
+        if args.channels:
+            payload["channels"] = parse_channels(args.channels)
+        return privileged("active_scan_start", payload, pretty)
+    if args.cmd == "active-scan-stop":
+        return privileged("active_scan_stop", {"phy": args.phy}, pretty)
+    if args.cmd == "survey":
+        return privileged("survey", {"iface": args.iface}, pretty)
+    if args.cmd == "ping":
+        return print_json(need_helper(rpc("ping")), pretty)
+    return 2
+
+
+def uid_to_home(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_dir
+    except Exception:
+        return f"/home/{os.environ.get('SUDO_USER') or os.environ.get('USER') or 'patrick'}"
+
+
+if __name__ == "__main__":
+    sys.exit(main())
