@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "patrick.radio-lab",
   "name": "Radio Lab",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "patrick",
   "license": "MIT",
   "description": "Manage multiple Wi-Fi NICs: park a lab radio, scan bands, and capture in parallel.",

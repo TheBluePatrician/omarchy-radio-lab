@@ -10,7 +10,8 @@ function emptyStatus() {
     radios: [],
     air: [],
     clients: [],
-    captures: []
+    captures: [],
+    warning: ""
   }
 }
 
@@ -128,6 +129,12 @@ function capMaxWidth(radio, band) {
   if (caps.max_width && caps.max_width[b] != null) advertised = Number(caps.max_width[b]) || 0
   if (caps.learned_width && caps.learned_width[b] != null) learned = Number(caps.learned_width[b]) || 0
   var w = Math.max(advertised, learned)
+  var driver = String((radio && radio.driver) || "")
+  // MT7921U is 80 MHz silicon. The helper used to invent 160 MHz; don't offer it.
+  if (driver.indexOf("mt7921") === 0) {
+    if (b === "2.4") return Math.min(w || 40, 40)
+    return Math.min(w || 80, 80)
+  }
   if (b === "2.4") return Math.min(w || 40, 40)
   if (w > 0) return w
   if (b === "6") return 80
@@ -329,6 +336,27 @@ function defaultBand(radio) {
   return ""
 }
 
+function preferredChannel(radio, band) {
+  var focus = band || defaultBand(radio)
+  if (!focus) return { channel: (radio && radio.channel) || 0, band: (radio && radio.band) || "" }
+  var list = capChannels(radio, focus)
+  function pick(preferred, fallback) {
+    if (list && list.indexOf(preferred) >= 0) return preferred
+    if (list && list.length) return list[0]
+    return fallback
+  }
+  if (focus === "6") {
+    var psc = radioPsc6(radio)
+    if (psc.indexOf(69) >= 0) return { channel: 69, band: "6" }
+    if (psc.length) return { channel: psc[0], band: "6" }
+    return { channel: pick(69, 5), band: "6" }
+  }
+  if (focus === "5") return { channel: pick(36, 36), band: "5" }
+  if (focus === "2.4") return { channel: pick(6, 6), band: "2.4" }
+  if (list && list.length) return { channel: list[0], band: focus }
+  return { channel: (radio && radio.channel) || 0, band: focus }
+}
+
 function isUplink(radio) {
   return !!(radio && radio.uplink)
 }
@@ -500,9 +528,18 @@ function clientRows(status, limit) {
 }
 
 function ssidLabel(row) {
-  if (!row) return "Hidden"
-  if (row.hidden && !row.ssid) return "(hidden)"
-  return row.ssid || "(hidden)"
+  if (!row) return "(hidden)"
+  var raw = row.ssid
+  if (raw === undefined || raw === null) raw = ""
+  var ssid = String(raw)
+  var cleaned = ""
+  for (var i = 0; i < ssid.length && cleaned.length < 32; i++) {
+    var c = ssid.charCodeAt(i)
+    if (c < 32 || c === 127) continue
+    cleaned += ssid.charAt(i)
+  }
+  if (!cleaned) return "(hidden)"
+  return cleaned
 }
 
 function captureName(path) {
@@ -572,6 +609,8 @@ if (typeof module !== "undefined") {
     scanningBand: scanningBand,
     channels24: channels24,
     radio24: radio24,
+    preferredChannel: preferredChannel,
+    defaultBand: defaultBand,
     capHint: capHint,
     capMaxWidth: capMaxWidth,
     capChannels: capChannels,

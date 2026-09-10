@@ -9,7 +9,11 @@ if [[ ${EUID} -ne 0 ]]; then
 fi
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
-ALLOW_UID="${PKEXEC_UID:-${SUDO_UID:-1000}}"
+ALLOW_UID="${PKEXEC_UID:-${SUDO_UID:-}}"
+if [[ -z ${ALLOW_UID} ]]; then
+  echo "configure-usb-nic.sh: cannot determine installing user (PKEXEC_UID/SUDO_UID unset)" >&2
+  exit 2
+fi
 ALLOW_USER="$(id -un "${ALLOW_UID}" 2>/dev/null || true)"
 ALLOW_HOME="$(getent passwd "${ALLOW_UID}" | cut -d: -f6)"
 ALLOW_HOME="${ALLOW_HOME:-/home/${ALLOW_USER:-${ALLOW_UID}}}"
@@ -65,9 +69,28 @@ if command -v nmcli >/dev/null 2>&1; then
   nmcli general reload || true
 fi
 
-# Reprobe so disable_clc=1 is actually loaded (module params apply at insert).
-for iface in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
-  if [[ $iface == rlab* || $iface == wlp0s20f0u* ]]; then
+is_usb_wireless() {
+  local iface=$1
+  local dev
+  [[ -e /sys/class/net/${iface}/phy80211 || -e /sys/class/net/${iface}/wireless ]] || return 1
+  dev=$(readlink -f "/sys/class/net/${iface}/device" 2>/dev/null || true)
+  [[ ${dev} == *"/usb"* ]]
+}
+
+# Tear down helper-created and USB wireless ifaces so the driver can reload.
+# Match any USB WNIC name (wlp…u…, wlx…, wlanN), not a single predictable path.
+ifaces=""
+if command -v iw >/dev/null 2>&1; then
+  ifaces=$(iw dev 2>/dev/null | awk '/Interface/{print $2}')
+fi
+if [[ -z ${ifaces} ]]; then
+  for d in /sys/class/net/*; do
+    [[ -e ${d}/phy80211 || -e ${d}/wireless ]] || continue
+    ifaces="${ifaces} $(basename "$d")"
+  done
+fi
+for iface in ${ifaces}; do
+  if [[ ${iface} == rlab* ]] || is_usb_wireless "${iface}"; then
     ip link set "$iface" down 2>/dev/null || true
     iw dev "$iface" del 2>/dev/null || true
   fi

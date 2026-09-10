@@ -3,7 +3,9 @@
 Omarchy bar widget for a multi-WNIC wireless lab. Inventory every nl80211
 radio, park a lab NIC in monitor, scan bands into AIR, and write pcaps.
 
-## Install on another Omarchy PC
+License: MIT. Passive monitoring only — no injection, deauth, or cracking.
+
+## Install
 
 ```
 omarchy plugin add https://github.com/TheBluePatrician/omarchy-radio-lab.git --enable
@@ -19,11 +21,28 @@ pkexec ~/.config/omarchy/plugins/patrick.radio-lab/bin/install.sh
 
 Update later with `omarchy plugin update patrick.radio-lab`.
 
-The cloned `patrick.network` widget stays in charge of joining Wi-Fi and
-picking which radio is the internet path (INTERFACE pills). Radio Lab is
-the extra radios: park a NIC in monitor, scan, and capture. **Restore
-Wi-Fi** hands a lab NIC back to NetworkManager so the network panel can
-use it; it is not the internet-radio selector.
+The stock `omarchy.network` widget stays in charge of joining Wi-Fi and
+picking which radio is the internet path. Radio Lab is the extra radios:
+park a NIC in monitor, scan, and capture. **Restore Wi-Fi** hands a lab
+NIC back to NetworkManager so the network panel can use it.
+
+## Remove
+
+```
+pkexec ~/.config/omarchy/plugins/patrick.radio-lab/bin/uninstall.sh
+omarchy plugin remove patrick.radio-lab
+```
+
+Uninstall stops the helper and removes `/usr/local/lib/radio-lab`, the
+`wnicd` service, and the polkit rule. Captures in `~/radio-lab/captures`
+are left in place.
+
+## Dependencies
+
+- `iw`, `ip` (iproute2), NetworkManager (`nmcli`)
+- Python 3 (stdlib only)
+- systemd and polkit (`pkexec`) for the helper
+- Optional: `wireless-regdb` for 6 GHz regulatory maps
 
 ## Bar
 
@@ -68,10 +87,11 @@ wnic-ctl enable phy1
 On a monitor NIC, captures are classic pcap with radiotap
 (`DLT_IEEE802_11_RADIO`) and open in Wireshark.
 
-The PCIe RTL8821CE cannot park in monitor mode. Capture on that radio is an
-`iw scan` survey: a `.jsonl` log of heard APs plus a `.pcap` of **beacons
-rebuilt from those scan results**. That pcap is not a live 802.11 listen.
-Use the USB lab NIC for a parked radiotap capture.
+Some chipsets (for example Realtek `rtw88`) cannot park in monitor mode.
+Capture on those radios is an `iw scan` survey: a `.jsonl` log of heard
+APs plus a `.pcap` of **beacons rebuilt from those scan results**. That
+pcap is not a live 802.11 listen. Use a USB lab NIC for a parked
+radiotap capture.
 
 ## Keys in the panel
 
@@ -85,5 +105,3 @@ Use the USB lab NIC for a parked radiotap capture.
 | `w` | restore Wi-Fi on the selected radio |
 | `o` | open capture folder |
 | `r` | refresh |
-
-Passive monitoring only — no injection, deauth, or cracking.

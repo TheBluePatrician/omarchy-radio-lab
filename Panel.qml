@@ -230,19 +230,16 @@ Panel {
     }
     if (!isPassive(radio)) {
       var band = bandFor(radio)
-      var ch = (String(radio.band || "") === String(band) && radio.channel) ? radio.channel : (band === "5" ? 36 : (band === "6" ? 69 : 6))
-      lab.captureStart(radio.phy, false, ch, band)
+      var pick = Model.preferredChannel(radio, band)
+      var ch = (String(radio.band || "") === String(band) && radio.channel) ? radio.channel : pick.channel
+      lab.captureStart(radio.phy, false, ch, pick.band || band)
       return
     }
     lab.captureStart(radio.phy, false)
   }
 
   function defaultChannel(radio) {
-    var bands = radio.bands || []
-    if (bands.indexOf("6") >= 0) return { channel: 69, band: "6" }
-    if (bands.indexOf("2.4") >= 0) return { channel: 6, band: "2.4" }
-    if (bands.indexOf("5") >= 0) return { channel: 36, band: "5" }
-    return { channel: radio.channel || 1, band: radio.band || "2.4" }
+    return Model.preferredChannel(radio, bandFor(radio))
   }
 
   function parkOn(radio, channel, width, band) {
@@ -301,8 +298,15 @@ Panel {
       return
     }
     unlockPhy(phy)
-    if (kind === "capture") lab.captureStart(phy, true)
-    else lab.monitorOn(phy, pendingChannel || 6, pendingWidth || 20, true, "")
+    var radio = null
+    for (var i = 0; i < radios.length; i++) {
+      if (radios[i] && radios[i].phy === phy) { radio = radios[i]; break }
+    }
+    var pick = radio ? defaultChannel(radio) : { channel: pendingChannel || 0, band: "" }
+    var channel = pendingChannel || pick.channel
+    var width = pendingWidth || (radio ? Model.parkWidth(radio, pick.band) : 20)
+    if (kind === "capture") lab.captureStart(phy, true, channel, pick.band)
+    else lab.monitorOn(phy, channel, width, true, pick.band)
   }
 
   function setRadioCursor(index) {
@@ -749,16 +753,18 @@ Panel {
           onClicked: lab.restoreWifi(card.radio.phy)
         }
         Button {
-          text: "Disable"
+          text: card.radio.disabled ? "Enable" : "Disable"
           fontFamily: root.fontFamily
           fontSize: Style.font.bodySmall
           foreground: root.foreground
           bordered: true
           selected: !!card.radio.disabled
           enabled: !lab.busy && root.helperReady
-          tooltipText: card.uplink
-            ? "Take this NIC down (drops internet). Click again to bring it back up."
-            : "Take this NIC down. Click again to bring it back up."
+          tooltipText: card.radio.disabled
+            ? "Bring this NIC back up without joining Wi-Fi"
+            : (card.uplink
+              ? "Take this NIC down (drops internet). Click again to bring it back up."
+              : "Take this NIC down. Click again to bring it back up.")
           onClicked: root.toggleDisable(card.radio)
         }
         Button {
@@ -991,12 +997,14 @@ Panel {
     }
     Text {
       id: ssidText
-      width: parent.width - chText.width - widthText.width - rssiText.width - secText.width - parent.spacing * 4
+      width: Math.max(0, parent.width - chText.width - widthText.width - rssiText.width - secText.width - parent.spacing * 4)
       text: Model.ssidLabel(row)
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       elide: Text.ElideRight
+      wrapMode: Text.NoWrap
+      clip: true
     }
     Text {
       id: secText

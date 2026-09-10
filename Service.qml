@@ -20,9 +20,28 @@ Item {
   property string stealKind: ""
   property var stealArgs: []
 
-  readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/patrick.radio-lab"
-  readonly property string ctl: pluginDir + "/bin/wnic-ctl"
-  readonly property string installer: pluginDir + "/bin/install.sh"
+  function urlToPath(url) {
+    var s = String(url || "")
+    if (s.indexOf("file://") === 0) s = s.slice(7)
+    if (s.length > 1 && s.charAt(s.length - 1) === "/") s = s.slice(0, -1)
+    try { s = decodeURIComponent(s) } catch (error) {}
+    return s
+  }
+  readonly property string pluginDir: {
+    var resolved = urlToPath(Qt.resolvedUrl("."))
+    if (resolved && resolved.charAt(0) === "/") return resolved
+    return Quickshell.env("HOME") + "/.config/omarchy/plugins/patrick.radio-lab"
+  }
+  readonly property string ctl: {
+    var resolved = urlToPath(Qt.resolvedUrl("bin/wnic-ctl"))
+    if (resolved && resolved.charAt(0) === "/") return resolved
+    return pluginDir + "/bin/wnic-ctl"
+  }
+  readonly property string installer: {
+    var resolved = urlToPath(Qt.resolvedUrl("bin/install.sh"))
+    if (resolved && resolved.charAt(0) === "/") return resolved
+    return pluginDir + "/bin/install.sh"
+  }
   readonly property string helperBin: "/usr/local/lib/radio-lab/wnicd"
   readonly property int refreshIntervalSec: {
     var n = parseInt(String(settings && settings.refreshIntervalSec != null ? settings.refreshIntervalSec : 2), 10)
@@ -49,11 +68,20 @@ Item {
     if (next && next.radios) {
       status = next
       if (next.error) lastError = next.error
-      else if (next.ok !== false) lastError = lastError && pendingKind ? lastError : ""
+      else if (next.warning) lastError = next.warning
     }
   }
 
+  function commandMissing(text) {
+    var err = String(text || "")
+    return err.indexOf("No such file") >= 0 || err.indexOf("not found") >= 0
+  }
+
   function refresh() {
+    if (!ctl) {
+      lastError = "Radio Lab helper CLI is missing"
+      return
+    }
     if (statusProc.running) return
     refreshing = true
     statusProc.running = true
@@ -61,6 +89,10 @@ Item {
 
   function runCtl(args) {
     if (actionProc.running) return
+    if (!ctl) {
+      lastError = "Radio Lab helper CLI is missing"
+      return
+    }
     lastError = ""
     actionProc.command = [ctl].concat(args)
     actionProc.running = true
@@ -241,8 +273,14 @@ Item {
     onExited: function(exitCode) {
       root.refreshing = false
       var text = String(statusStdout.text || "")
+      var stderr = String(statusStderr.text || "").trim()
       if (text) root.parseAndApply(text)
-      else if (exitCode !== 0) root.lastError = String(statusStderr.text || "status failed").trim()
+      else if (exitCode !== 0) {
+        if (exitCode === 127 || root.commandMissing(stderr))
+          root.lastError = "wnic-ctl is missing from the plugin"
+        else
+          root.lastError = stderr || "status failed"
+      }
     }
   }
 
@@ -257,7 +295,10 @@ Item {
       var stderr = String(actionStderr.text || "").trim()
       if (stdout) root.handleActionOutput(stdout, exitCode)
       else {
-        root.lastError = stderr || (exitCode === 0 ? "" : "Command failed")
+        if (exitCode === 127 || root.commandMissing(stderr))
+          root.lastError = "wnic-ctl is missing from the plugin"
+        else
+          root.lastError = stderr || (exitCode === 0 ? "" : "Command failed")
         root.pendingPhy = ""
         root.pendingKind = ""
         root.delayedRefresh.restart()
@@ -329,8 +370,17 @@ Item {
     repeat: false
     running: statusProc.running || actionProc.running
     onTriggered: {
-      if (statusProc.running) statusProc.running = false
-      if (actionProc.running) actionProc.running = false
+      if (statusProc.running) {
+        statusProc.running = false
+        root.refreshing = false
+        if (!root.lastError) root.lastError = "status timed out"
+      }
+      if (actionProc.running) {
+        actionProc.running = false
+        root.pendingPhy = ""
+        root.pendingKind = ""
+        if (!root.lastError) root.lastError = "Command timed out"
+      }
     }
   }
 

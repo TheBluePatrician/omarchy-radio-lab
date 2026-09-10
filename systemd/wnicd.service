@@ -8,9 +8,11 @@ Wants=NetworkManager.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/radio-lab/wnicd daemon --foreground --allow-uid 1000 --capture-dir /home/patrick/radio-lab/captures
+ExecStart=/usr/local/lib/radio-lab/wnicd daemon --foreground --allow-uid 1000 --capture-dir /home/USER/radio-lab/captures
 Restart=on-failure
 RestartSec=2
+TimeoutStopSec=10
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target

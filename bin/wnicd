@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,8 +44,14 @@ ARPHRD_TO_DLT = {
     ARPHRD_IEEE80211_PRISM: DLT_PRISM_HEADER,
     ARPHRD_IEEE80211_RADIOTAP: DLT_IEEE802_11_RADIO,
 }
+SOL_PACKET = getattr(socket, "SOL_PACKET", 263)
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_MR_PROMISC = 1
 MAX_AIR = 400
 MAX_CLIENTS = 300
+AIR_TTL_SEC = 180
+CLIENT_TTL_SEC = 180
+MAX_RPC_CLIENTS = 8
 
 # 80 MHz center channel for a primary 20 MHz channel (IEEE 802.11ac layout).
 VHT80_CENTER = {
@@ -178,28 +185,30 @@ def sysfs_uevent(device: Path) -> dict[str, str]:
 
 
 def is_lab_radio(sysfs: dict) -> bool:
-    driver = str(sysfs.get("driver") or "").lower()
-    if sysfs.get("bus") == "usb":
-        return True
-    return driver.startswith("mt7921") or driver.startswith("mt792x")
+    """USB WNICs are extra lab radios. Built-in PCIe/SDIO chips are not."""
+    return sysfs.get("bus") == "usb"
 
 
 def is_uplink_radio(sysfs: dict) -> bool:
     if is_lab_radio(sysfs):
         return False
-    return sysfs.get("bus") == "pci"
+    return True
 
 
 def default_route_iface() -> str:
-    code, out, _ = run(["ip", "-4", "route", "show", "default"], timeout=3)
-    if code != 0:
-        return ""
-    for line in out.splitlines():
-        parts = line.split()
-        if "dev" in parts:
-            idx = parts.index("dev")
-            if idx + 1 < len(parts):
-                return parts[idx + 1]
+    for args in (
+        ["ip", "-4", "route", "show", "default"],
+        ["ip", "-6", "route", "show", "default"],
+    ):
+        code, out, _ = run(args, timeout=3)
+        if code != 0:
+            continue
+        for line in out.splitlines():
+            parts = line.split()
+            if "dev" in parts:
+                idx = parts.index("dev")
+                if idx + 1 < len(parts):
+                    return parts[idx + 1]
     return ""
 
 
@@ -327,6 +336,26 @@ def freq_of_channel(channel: int, band: str = "") -> int | None:
     if band == "6":
         return 5950 + 5 * channel
     return None
+
+
+def channel_list(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [part for part in re.split(r"[,\s]+", value) if part]
+    elif isinstance(value, (list, tuple)):
+        parts = list(value)
+    else:
+        parts = [value]
+    out: list[int] = []
+    for part in parts:
+        try:
+            number = int(part)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            out.append(number)
+    return out
 
 
 def infer_band(channel: int, band: str = "", mhz: float | int | None = None) -> str:
@@ -525,7 +554,7 @@ def _merge_band_caps(dst: dict, src: dict) -> dict:
     return dst
 
 
-def build_capabilities(info: dict, learned: dict | None = None) -> dict:
+def build_capabilities(info: dict, learned: dict | None = None, driver: str = "") -> dict:
     channels_by_band: dict[str, list[int]] = {"2.4": [], "5": [], "6": []}
     radar_by_band: dict[str, list[int]] = {"2.4": [], "5": [], "6": []}
     for ch in info.get("channels") or []:
@@ -556,9 +585,6 @@ def build_capabilities(info: dict, learned: dict | None = None) -> dict:
     for band in info.get("bands") or []:
         if band not in max_width:
             max_width[band] = {"2.4": 40, "5": 80, "6": 80}.get(band, 20)
-    # STA HE MCS on 6 GHz often undersells monitor RX; offer 160 unless EHT/320 is present.
-    if "6" in max_width and he and max_width["6"] < 160:
-        max_width["6"] = 160
     learned_width: dict[str, int] = {}
     for band, value in (learned or {}).items():
         try:
@@ -570,6 +596,12 @@ def build_capabilities(info: dict, learned: dict | None = None) -> dict:
             max_width[str(band)] = max(int(max_width.get(str(band)) or 20), width)
     if "2.4" in max_width:
         max_width["2.4"] = min(int(max_width["2.4"]), 40)
+    if is_mt7921(driver):
+        for band in ("5", "6"):
+            if band in max_width:
+                max_width[band] = min(int(max_width[band] or 80), 80)
+            if band in learned_width:
+                learned_width[band] = min(int(learned_width[band] or 80), 80)
     return {
         "bands": list(info.get("bands") or []),
         "max_width": max_width,
@@ -714,7 +746,7 @@ def parse_iw_dev(text: str) -> list[dict]:
     skipping_unnamed = False
     for raw in text.splitlines():
         line = raw.rstrip()
-        phy_match = IFACE_PHY_RE.match(line)
+        phy_match = IFACE_PHY_RE.match(line.strip())
         if phy_match:
             phy = f"phy{phy_match.group(1)}"
             skipping_unnamed = False
@@ -725,11 +757,12 @@ def parse_iw_dev(text: str) -> list[dict]:
                 current = None
             skipping_unnamed = True
             continue
-        if line.startswith("Interface ") or line.startswith("\tInterface "):
+        stripped_head = line.strip()
+        if stripped_head.startswith("Interface "):
             skipping_unnamed = False
             if current:
                 ifaces.append(current)
-            name = line.strip().split()[-1]
+            name = stripped_head.split()[-1]
             current = {
                 "iface": name,
                 "phy": phy,
@@ -821,6 +854,54 @@ def list_phys() -> list[str]:
     return sorted(p.name for p in root.iterdir() if p.name.startswith("phy"))
 
 
+def iface_type_from_sysfs(iface: str) -> str:
+    arphrd = iface_arphrd(iface)
+    if arphrd in (ARPHRD_IEEE80211, ARPHRD_IEEE80211_PRISM, ARPHRD_IEEE80211_RADIOTAP):
+        return "monitor"
+    return "managed"
+
+
+def sysfs_wireless_ifaces() -> dict[str, list[str]]:
+    """Map phy -> iface names from sysfs. Works for any netdev name, without `iw`."""
+    by_phy: dict[str, list[str]] = {}
+
+    def add(phy: str, name: str) -> None:
+        if not phy or not name or not phy.startswith("phy"):
+            return
+        names = by_phy.setdefault(phy, [])
+        if name not in names:
+            names.append(name)
+
+    net = Path("/sys/class/net")
+    if net.is_dir():
+        try:
+            entries = list(net.iterdir())
+        except OSError:
+            entries = []
+        for iface_dir in entries:
+            phy_link = iface_dir / "phy80211"
+            if not phy_link.exists() and not (iface_dir / "wireless").exists():
+                continue
+            phy = read_link(phy_link) if phy_link.exists() else ""
+            if not phy:
+                try:
+                    phy = os.path.basename(os.path.realpath(phy_link))
+                except OSError:
+                    phy = ""
+            add(phy, iface_dir.name)
+    for phy in list_phys():
+        net_dir = Path("/sys/class/ieee80211") / phy / "device" / "net"
+        if not net_dir.is_dir():
+            continue
+        try:
+            children = list(net_dir.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            add(phy, child.name)
+    return by_phy
+
+
 def iface_exists(name: str) -> bool:
     return bool(name) and Path(f"/sys/class/net/{name}").exists()
 
@@ -837,6 +918,78 @@ def iface_rx_tx(iface: str) -> tuple[int, int]:
     except ValueError:
         return 0, 0
     return rx, tx
+
+
+def iface_rx_packets(iface: str) -> int:
+    try:
+        return int(read_text(Path("/sys/class/net") / iface / "statistics" / "rx_packets", "0") or "0")
+    except ValueError:
+        return 0
+
+
+def is_mt7921(driver: str) -> bool:
+    return str(driver or "").lower().startswith("mt7921")
+
+
+def monitor_max_width(driver: str, band: str, advertised: int = 0) -> int:
+    """Widest channel this radio can actually listen on.
+
+    MT7921/MT7921U is an 80 MHz 2x2 Wi-Fi 6E part: this phy's HE/VHT maps
+    stop at 80 MHz, ALFA's MT7921AUN spec is 20/40/80, and a 160 MHz
+    sniffer config on the same USB id has been measured at zero frames.
+    `iw` still accepts 160 MHz, then firmware RX goes silent.
+    """
+    b = str(band or "")
+    want = int(advertised or 0)
+    if b == "2.4":
+        return min(want or 40, 40)
+    if is_mt7921(driver):
+        return min(want or 80, 80)
+    return want or (80 if b in ("5", "6") else 20)
+
+
+def _write_sysfs(path: Path, value: str) -> None:
+    try:
+        path.write_text(value, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def usb_forbid_autosuspend(iface: str) -> None:
+    if not iface:
+        return
+    try:
+        cur = Path(f"/sys/class/net/{iface}/device").resolve()
+    except OSError:
+        return
+    for _ in range(10):
+        if (cur / "idVendor").exists():
+            _write_sysfs(cur / "power" / "control", "on")
+            return
+        parent = cur.parent
+        if parent == cur:
+            return
+        cur = parent
+
+
+def mt76_disable_pm(phy: str) -> None:
+    if not phy:
+        return
+    root = Path("/sys/kernel/debug/ieee80211") / phy / "mt76"
+    for name in ("runtime-pm", "deep-sleep"):
+        _write_sysfs(root / name, "0")
+
+
+def packet_set_promisc(sock: socket.socket, iface: str) -> None:
+    try:
+        ifindex = socket.if_nametoindex(iface)
+    except OSError:
+        return
+    mreq = struct.pack("IHH8s", ifindex, PACKET_MR_PROMISC, 0, b"\x00" * 8)
+    try:
+        sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1145,72 @@ def _he_op_width(data: bytes) -> int:
     return 0
 
 
+def mpdu_without_fcs(frame: bytes, has_fcs: bool = False) -> bytes | None:
+    """Strip an 802.11 FCS when present. Drop the frame if radiotap said FCS and it is bad."""
+    if len(frame) < 4:
+        return None if has_fcs else frame
+    body = frame[:-4]
+    got = struct.unpack("<I", frame[-4:])[0]
+    calc = zlib.crc32(body) & 0xFFFFFFFF
+    if calc == got:
+        return body
+    if has_fcs:
+        return None
+    return frame
+
+
+def is_unicast_mac(mac: str) -> bool:
+    parts = mac_colon(mac).split(":")
+    if len(parts) != 6:
+        return False
+    try:
+        first = int(parts[0], 16)
+    except ValueError:
+        return False
+    if first & 0x01:
+        return False
+    if mac_colon(mac) in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"):
+        return False
+    return True
+
+
+def decode_ssid(data: bytes) -> str | None:
+    """SSID from an IE payload. None = invalid (ignore). Empty string = hidden."""
+    if len(data) > 32:
+        return None
+    data = data.rstrip(b"\x00")
+    if not data:
+        return ""
+    if b"\x00" in data:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+        if text.count("\ufffd") > max(1, len(text) // 4):
+            return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    return text
+
+
+def ssid_quality(text: str | None) -> int:
+    if not text:
+        return 0
+    bad = sum(1 for ch in text if ord(ch) < 32 or ch in ("\ufffd", "\x7f"))
+    if bad:
+        return 1
+    return 2
+
+
+def prefer_ssid(new, old) -> str:
+    new_s = "" if new is None else str(new)
+    old_s = "" if old is None else str(old)
+    if ssid_quality(old_s) >= ssid_quality(new_s) and old_s:
+        return old_s
+    return new_s
+
+
 def parse_ies(body: bytes) -> dict:
     ssid = None
     channel = 0
@@ -1013,10 +1232,12 @@ def parse_ies(body: bytes) -> dict:
         data = body[offset:offset + length]
         offset += length
         if tag == 0:
-            try:
-                ssid = data.decode("utf-8", errors="replace")
-            except Exception:
-                ssid = data.decode("latin1", errors="replace")
+            if length > 32:
+                break
+            if ssid is None:
+                decoded = decode_ssid(data)
+                if decoded is not None:
+                    ssid = decoded
         elif tag == 3 and data:
             channel = data[0]
         elif tag == 48:
@@ -1082,25 +1303,33 @@ def security_label(cap: int, ies: dict) -> str:
 
 
 def parse_mgmt_frame(frame: bytes, rt: dict) -> dict | None:
-    if len(frame) < 24:
+    frame = mpdu_without_fcs(frame, bool(rt.get("has_fcs")))
+    if frame is None or len(frame) < 24:
         return None
-    if rt.get("has_fcs") and len(frame) >= 28:
-        frame = frame[:-4]
     fc = struct.unpack_from("<H", frame, 0)[0]
     ftype = (fc >> 2) & 0x3
     subtype = (fc >> 4) & 0xF
+    if ftype != 0:
+        return None
+    if fc & 0x4000:
+        return None
+    hdr_len = 24
+    if fc & 0x8000:
+        hdr_len += 4
+        if len(frame) < hdr_len:
+            return None
     addr1 = mac_colon(frame[4:10])
     addr2 = mac_colon(frame[10:16])
     addr3 = mac_colon(frame[16:22])
     freq = rt.get("freq") or 0
     rssi = rt.get("rssi")
-    if ftype != 0:
-        return None
     if subtype in (8, 5):  # beacon / probe response
-        if len(frame) < 36:
+        if not is_unicast_mac(addr3):
             return None
-        cap = struct.unpack_from("<H", frame, 34)[0]
-        ies = parse_ies(frame[36:])
+        if len(frame) < hdr_len + 12:
+            return None
+        cap = struct.unpack_from("<H", frame, hdr_len + 10)[0]
+        ies = parse_ies(frame[hdr_len + 12:])
         channel = ies["channel"]
         if freq and (not channel or freq >= 5925):
             if 5925 <= freq < 7125:
@@ -1109,12 +1338,13 @@ def parse_mgmt_frame(frame: bytes, rt: dict) -> dict | None:
                 channel = 14 if freq == 2484 else (freq - 2407) // 5
             elif 5000 <= freq < 5925:
                 channel = (freq - 5000) // 5
+        ssid = ies["ssid"]
         return {
             "kind": "ap",
             "bssid": addr3,
             "src": addr2,
-            "ssid": ies["ssid"],
-            "hidden": ies["ssid"] is None or ies["ssid"] == "",
+            "ssid": ssid or "",
+            "hidden": ssid is None or ssid == "",
             "channel": channel,
             "freq": freq,
             "band": band_of_freq(freq),
@@ -1126,7 +1356,9 @@ def parse_mgmt_frame(frame: bytes, rt: dict) -> dict | None:
             "width": (ies.get("he6_width") if freq >= 5925 else 0) or ies.get("vht_width") or ies.get("ht_width") or 20,
         }
     if subtype == 4:  # probe request
-        ies = parse_ies(frame[24:])
+        if len(frame) < hdr_len:
+            return None
+        ies = parse_ies(frame[hdr_len:])
         return {
             "kind": "probe",
             "client": addr2,
@@ -1155,6 +1387,19 @@ class PcapWriter:
         self.packets = 0
         self.bytes = 24
         self.lock = threading.Lock()
+        self.closed = False
+
+    def ensure_dlt(self, dlt: int) -> None:
+        dlt = int(dlt or 0)
+        if not dlt or dlt == self.dlt:
+            return
+        with self.lock:
+            if self.closed or self.packets:
+                return
+            self.dlt = dlt
+            self.fp.seek(0)
+            self.fp.write(struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, SNAPLEN, self.dlt))
+            self.fp.flush()
 
     def write(self, packet: bytes) -> None:
         now = time.time()
@@ -1163,6 +1408,8 @@ class PcapWriter:
         data = packet[:SNAPLEN]
         header = struct.pack("<IIII", sec, usec, len(data), len(packet))
         with self.lock:
+            if self.closed:
+                return
             self.fp.write(header + data)
             self.fp.flush()
             self.packets += 1
@@ -1170,6 +1417,9 @@ class PcapWriter:
 
     def close(self) -> None:
         with self.lock:
+            if self.closed:
+                return
+            self.closed = True
             try:
                 self.fp.flush()
                 self.fp.close()
@@ -1183,17 +1433,27 @@ class SurveyLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.fp = self.path.open("a", encoding="utf-8")
         self.rows = 0
+        self.lock = threading.Lock()
+        self.closed = False
 
     def write(self, obj: dict) -> None:
-        self.fp.write(json.dumps(obj) + "\n")
-        self.fp.flush()
-        self.rows += 1
+        line = json.dumps(obj) + "\n"
+        with self.lock:
+            if self.closed:
+                return
+            self.fp.write(line)
+            self.fp.flush()
+            self.rows += 1
 
     def close(self) -> None:
-        try:
-            self.fp.close()
-        except OSError:
-            pass
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                self.fp.close()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1467,9 @@ _phy_cache_at = 0.0
 def iw_phy_info(phy: str | None = None) -> dict[str, dict]:
     global _phy_cache, _phy_cache_at
     now = time.time()
-    if _phy_cache and now - _phy_cache_at < 8:
+    live = list_phys()
+    cache_miss = bool(live) and any(name not in _phy_cache for name in live)
+    if _phy_cache and not cache_miss and now - _phy_cache_at < 8:
         return _phy_cache
     args = ["iw", "phy"]
     if phy:
@@ -1220,11 +1482,42 @@ def iw_phy_info(phy: str | None = None) -> dict[str, dict]:
     return parsed or _phy_cache
 
 
+def _empty_iface(name: str, phy: str) -> dict:
+    return {
+        "iface": name,
+        "phy": phy,
+        "ifindex": 0,
+        "mac": "",
+        "ssid": "",
+        "type": iface_type_from_sysfs(name) if name else "",
+        "channel": 0,
+        "freq": 0,
+        "width": 0,
+        "center1": 0,
+        "txpower": None,
+    }
+
+
+def merge_sysfs_ifaces(ifaces: list[dict]) -> list[dict]:
+    seen = {(item.get("phy") or "", item.get("iface") or "") for item in ifaces}
+    merged = list(ifaces)
+    for phy, names in sysfs_wireless_ifaces().items():
+        for name in names:
+            key = (phy, name)
+            if not name or key in seen:
+                continue
+            merged.append(_empty_iface(name, phy))
+            seen.add(key)
+    return merged
+
+
 def collect_inventory(extra: dict | None = None) -> dict:
     extra = extra or {}
     phys_info = iw_phy_info()
     code, dev_out, _ = run(["iw", "dev"], timeout=5)
+    iw_missing = code == 127
     ifaces = parse_iw_dev(dev_out) if code == 0 else []
+    ifaces = merge_sysfs_ifaces(ifaces)
     _nm_code, nm_out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"], timeout=4)
     nm = parse_nmcli_devices(nm_out)
     by_phy: dict[str, list[dict]] = {}
@@ -1264,7 +1557,7 @@ def collect_inventory(extra: dict | None = None) -> dict:
             else:
                 role = "station"
         passive = supports_passive_monitor(sysfs, info)
-        caps = build_capabilities(info, radio_extra.get("learned_width") or {})
+        caps = build_capabilities(info, radio_extra.get("learned_width") or {}, sysfs.get("driver") or "")
         caps["passive_monitor"] = passive
         station_name = (station or {}).get("iface", "")
         error = radio_extra.get("error", "") or ""
@@ -1318,7 +1611,10 @@ def collect_inventory(extra: dict | None = None) -> dict:
         "state": "stopped" if not socket_alive() else "running",
         "socket": DEFAULT_SOCKET,
     }
-    return {
+    if iw_missing:
+        helper = dict(helper)
+        helper["iw"] = "missing"
+    payload = {
         "ok": True,
         "plugin": PLUGIN_ID,
         "ts": utc_now(),
@@ -1333,6 +1629,9 @@ def collect_inventory(extra: dict | None = None) -> dict:
         "clients": extra.get("clients") or [],
         "captures": extra.get("captures") or list_captures(extra.get("capture_dir") or default_capture_dir()),
     }
+    if iw_missing:
+        payload["warning"] = "iw not installed; radio inventory is sysfs-only"
+    return payload
 
 
 def default_capture_dir() -> str:
@@ -1401,6 +1700,8 @@ class RadioLab:
         self.writers: dict[str, PcapWriter] = {}
         self.surveys: dict[str, object] = {}
         self.stop = threading.Event()
+        self.command_lock = threading.Lock()
+        self.client_slots = threading.Semaphore(MAX_RPC_CLIENTS)
         Path(DEFAULT_DIR).mkdir(parents=True, exist_ok=True)
 
     def helper_meta(self) -> dict:
@@ -1412,8 +1713,16 @@ class RadioLab:
             "capture_dir": str(self.capture_dir),
         }
 
+    def _expire_seen(self, table: OrderedDict, ttl: int) -> None:
+        now = time.time()
+        stale = [key for key, row in table.items() if now - float(row.get("last_seen") or 0) > ttl]
+        for key in stale:
+            table.pop(key, None)
+
     def snapshot(self) -> dict:
         with self.lock:
+            self._expire_seen(self.air, AIR_TTL_SEC)
+            self._expire_seen(self.clients, CLIENT_TTL_SEC)
             radios = json.loads(json.dumps(self.radios))
             air = list(self.air.values())
             clients = list(self.clients.values())[-40:]
@@ -1451,8 +1760,12 @@ class RadioLab:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload), encoding="utf-8")
             tmp.replace(path)
-            os.chmod(path, 0o644)
-        except OSError:
+            try:
+                os.chown(path, self.allow_uid, -1)
+            except OSError:
+                pass
+            os.chmod(path, 0o600)
+        except (OSError, TypeError, ValueError):
             pass
 
     def adopt(self) -> None:
@@ -1487,6 +1800,9 @@ class RadioLab:
 
     def handle(self, req: dict) -> dict:
         cmd = str(req.get("cmd") or "")
+        mutating = cmd not in ("status", "ping", "")
+        if mutating and not self.command_lock.acquire(timeout=25):
+            return {"ok": False, "error": "busy"}
         try:
             if cmd == "status":
                 return {"ok": True, "data": self.snapshot()}
@@ -1527,6 +1843,9 @@ class RadioLab:
             return {"ok": False, "error": f"unknown command {cmd}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        finally:
+            if mutating:
+                self.command_lock.release()
 
     def _radio(self, phy: str) -> dict:
         with self.lock:
@@ -1535,6 +1854,72 @@ class RadioLab:
     def _note_error(self, phy: str, message: str) -> None:
         with self.lock:
             self.radios.setdefault(phy, {})["error"] = message
+
+    def _is_last_station(self, inventory: dict, phy: str) -> bool:
+        stations: list[str] = []
+        for radio in inventory.get("radios") or []:
+            if radio.get("disabled"):
+                continue
+            role = radio.get("role") or "station"
+            if role in ("monitor", "hopper"):
+                continue
+            ifaces = radio.get("ifaces") or []
+            has_managed = bool(radio.get("station_iface")) or any(
+                item.get("type") == "managed" for item in ifaces
+            )
+            if has_managed or role in ("station", "active"):
+                stations.append(str(radio.get("phy") or ""))
+        return bool(phy) and phy in stations and len(stations) <= 1
+
+    def _ensure_station_iface(self, phy: str, radio: dict | None = None) -> tuple[str, str | None]:
+        """Return (iface, error). Creates a managed netdev if this phy has none."""
+        radio = radio or {}
+        candidates: list[str] = []
+        for key in ("station_iface", "converted_iface", "original_iface", "stolen_iface", "silenced_iface"):
+            value = str(radio.get(key) or "")
+            if value and value not in candidates:
+                candidates.append(value)
+        extra = self.radios.get(phy) or {}
+        for key in ("converted_iface", "original_iface", "stolen_iface", "silenced_iface"):
+            value = str(extra.get(key) or "")
+            if value and value not in candidates:
+                candidates.append(value)
+        for item in radio.get("ifaces") or []:
+            value = str(item.get("iface") or "")
+            if value and value not in candidates:
+                candidates.append(value)
+        for value in sysfs_wireless_ifaces().get(phy) or []:
+            if value and value not in candidates:
+                candidates.append(value)
+        for name in candidates:
+            if name.startswith(RLAB_PREFIX):
+                continue
+            if iface_exists(name):
+                self._remember_original(phy, name)
+                return name, None
+        remembered = next((n for n in candidates if n and not n.startswith(RLAB_PREFIX)), "")
+        index = radio.get("index")
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = -1
+        if index < 0:
+            try:
+                index = int(str(phy).replace("phy", "") or 0)
+            except ValueError:
+                index = 0
+        target = remembered or f"wlan{index}"
+        if iface_exists(target):
+            n = index
+            while iface_exists(f"wlan{n}"):
+                n += 1
+            target = f"wlan{n}"
+        add = run(["iw", "phy", phy, "interface", "add", target, "type", "managed"])
+        if add[0] != 0:
+            return "", (add[2] or add[1] or f"could not create station iface on {phy}").strip()
+        run(["ip", "link", "set", target, "up"], timeout=3)
+        self._remember_original(phy, target)
+        return target, None
 
     def monitor_on(self, req: dict) -> dict:
         phy = str(req.get("phy") or "")
@@ -1554,12 +1939,24 @@ class RadioLab:
             return self.active_scan_start(req)
         if not radio.get("can_monitor"):
             return {"ok": False, "error": f"{phy} does not advertise monitor mode"}
-        if radio.get("uplink") and not steal:
+        last_station = self._is_last_station(inventory, phy)
+        if not steal and (radio.get("uplink") or last_station):
+            product = radio.get("product") or phy
+            if radio.get("uplink"):
+                message = (
+                    f"{product} is the internet Wi-Fi radio. Use Restore Wi-Fi if you already "
+                    "dropped the link, or confirm Use for lab to convert it."
+                )
+            else:
+                message = (
+                    f"{product} is the only station Wi-Fi interface. Monitor mode will drop "
+                    "Wi-Fi. Plug in another WNIC or confirm to convert it."
+                )
             return {
                 "ok": False,
-                "error": f"{radio.get('product') or phy} is the internet Wi-Fi radio. Use Restore Wi-Fi if you already dropped the link, or confirm Use for lab to convert it.",
+                "error": message,
                 "needs_steal": True,
-                "uplink": True,
+                "uplink": bool(radio.get("uplink")),
             }
 
         mon = radio.get("monitor_iface") or ""
@@ -1571,7 +1968,7 @@ class RadioLab:
             iface, stolen, err = self._create_monitor(phy, radio, steal)
             if err:
                 self._note_error(phy, err)
-                return {"ok": False, "error": err, "needs_steal": "only station" in err}
+                return {"ok": False, "error": err, "needs_steal": False}
             with self.lock:
                 state = self._radio(phy)
                 state["monitor_iface"] = iface
@@ -1609,6 +2006,24 @@ class RadioLab:
                 self._radio(phy)["width"] = width or 20
         return {"ok": True, "data": self.snapshot()}
 
+    def _wake_monitor(self, iface: str, phy: str = "", set_filter: bool = False) -> None:
+        """Keep a monitor vif receiving. mt7921u re-enables power save after tune."""
+        if not iface or not iface_exists(iface):
+            return
+        run(["ip", "link", "set", iface, "up"], timeout=3)
+        run(["ip", "link", "set", iface, "promisc", "on"], timeout=3)
+        run(["iw", "dev", iface, "set", "power_save", "off"], timeout=3)
+        if set_filter:
+            flags = run(
+                ["iw", "dev", iface, "set", "monitor", "fcsfail", "control", "otherbss"],
+                timeout=3,
+            )
+            if flags[0] != 0:
+                run(["iw", "dev", iface, "set", "monitor", "none"], timeout=3)
+        usb_forbid_autosuspend(iface)
+        use_phy = phy or self.phy_of_iface(iface) or ""
+        mt76_disable_pm(use_phy)
+
     def _unmanage_iface(self, name: str) -> None:
         if not name:
             return
@@ -1643,11 +2058,11 @@ class RadioLab:
         conv = run(["iw", "dev", name, "set", "type", "monitor"])
         if conv[0] != 0:
             return (conv[2] or conv[1] or f"could not set {name} to monitor").strip()
-        run(["iw", "dev", name, "set", "power_save", "off"], timeout=3)
         up = run(["ip", "link", "set", name, "up"])
         if up[0] != 0:
             return (up[2] or up[1] or f"failed to bring {name} up").strip()
         run(["ip", "addr", "flush", "dev", name])
+        self._wake_monitor(name, set_filter=True)
         return None
 
     def _convert_to_managed(self, name: str, up: bool = True) -> str:
@@ -1691,6 +2106,7 @@ class RadioLab:
             if self._iface_type(target) == "monitor":
                 run(["ip", "link", "set", target, "up"])
                 run(["ip", "addr", "flush", "dev", target])
+                self._wake_monitor(target, phy, set_filter=True)
                 self._remember_original(phy, target)
                 return target, (target if steal and radio.get("uplink") else None), None
             convert_err = self._convert_to_monitor(target) or ""
@@ -1715,6 +2131,7 @@ class RadioLab:
         if up[0] != 0:
             run(["iw", "dev", name, "del"])
             return "", None, (up[2] or up[1] or "failed to bring monitor iface up").strip()
+        self._wake_monitor(name, phy, set_filter=True)
         if target and iface_exists(target) and target != name:
             self._unmanage_iface(target)
             self._delete_iface(target)
@@ -1931,6 +2348,10 @@ class RadioLab:
             name = item.get("iface") or ""
             if name and not name.startswith(RLAB_PREFIX):
                 return name
+        if phy:
+            for name in sysfs_wireless_ifaces().get(phy) or []:
+                if name and not name.startswith(RLAB_PREFIX):
+                    return name
         return ""
 
     def _restore_one_radio(self, radio: dict) -> str:
@@ -1945,7 +2366,9 @@ class RadioLab:
         merged.update(self.radios.get(phy) or {})
         iface = self._station_name(merged)
         if not iface or not iface_exists(iface):
-            return f"no station interface on {phy}"
+            iface, err = self._ensure_station_iface(phy, merged)
+            if err:
+                return err
         return self._remanage_iface(iface, connect=True)
 
     def restore_wifi(self, req: dict) -> dict:
@@ -2026,15 +2449,8 @@ class RadioLab:
         elif iface and iface_exists(iface):
             run(["ip", "link", "set", iface, "up"])
             err = ""
-        elif iface:
-            add = run(["iw", "phy", phy, "interface", "add", iface, "type", "managed"])
-            if add[0] != 0:
-                err = (add[2] or add[1] or f"could not recreate {iface}").strip()
-            else:
-                run(["ip", "link", "set", iface, "up"])
-                err = ""
         else:
-            err = f"no station interface on {phy}"
+            iface, err = self._ensure_station_iface(phy, merged)
         with self.lock:
             state = self._radio(phy)
             state["disabled"] = False
@@ -2062,13 +2478,16 @@ class RadioLab:
                     self._radio(phy)["silenced_iface"] = name
 
     def _tune(self, iface: str, channel: int, width: int, band: str, mhz: int | None) -> tuple[int, int, str]:
+        phy = self.phy_of_iface(iface) or ""
+        driver = str(phy_sysfs(phy).get("driver") or "") if phy else ""
+        width = monitor_max_width(driver, band, int(width or 20))
         freq = int(mhz or freq_of_channel(channel, band) or 0)
         if freq <= 0:
             return 2, width, f"cannot map channel {channel} on {band or 'unknown'} band to a frequency"
         attempts = tune_commands(iface, channel, width, band, freq)
         last = "failed to set frequency"
         # Tune while UP. Taking monitor down on mt7921u stops 2.4 GHz RX until a full reset.
-        run(["ip", "link", "set", iface, "up"], timeout=3)
+        self._wake_monitor(iface, phy)
 
         def try_all() -> tuple[int, int, str] | None:
             nonlocal last
@@ -2080,12 +2499,13 @@ class RadioLab:
             return None
 
         hit = try_all()
+        if not hit:
+            run(["ip", "link", "set", iface, "down"], timeout=3)
+            run(["ip", "link", "set", iface, "up"], timeout=3)
+            self._wake_monitor(iface, phy)
+            hit = try_all()
         if hit:
-            return hit
-        run(["ip", "link", "set", iface, "down"], timeout=3)
-        run(["ip", "link", "set", iface, "up"], timeout=3)
-        hit = try_all()
-        if hit:
+            self._wake_monitor(iface, phy)
             return hit
         return 1, width, last
 
@@ -2103,6 +2523,7 @@ class RadioLab:
             radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
             if radio and not radio.get("passive_monitor"):
                 return self.active_scan_start(req)
+            width = monitor_max_width(str((radio or {}).get("driver") or ""), band, width)
         if not iface:
             return {"ok": False, "error": "monitor iface is required"}
         if channel <= 0 and not mhz:
@@ -2142,10 +2563,7 @@ class RadioLab:
 
     def scan_start(self, req: dict) -> dict:
         phy = str(req.get("phy") or "")
-        channels = req.get("channels") or []
-        if isinstance(channels, str):
-            channels = [int(x) for x in re.split(r"[,\s]+", channels) if x]
-        channels = [int(c) for c in channels if int(c) > 0]
+        channels = channel_list(req.get("channels") or [])
         band = str(req.get("band") or "")
         if not phy:
             return {"ok": False, "error": "phy is required"}
@@ -2163,9 +2581,11 @@ class RadioLab:
             inventory = collect_inventory({"radios": self.radios})
             radio = next((r for r in inventory["radios"] if r["phy"] == phy), None) or radio
         iface = radio.get("station_iface") or self._station_name(radio) or ""
-        if not iface:
-            return {"ok": False, "error": f"no station interface on {phy} for scan"}
-        if radio.get("lab") or radio.get("bus") == "usb":
+        if not iface or not iface_exists(iface):
+            iface, err = self._ensure_station_iface(phy, radio)
+            if err:
+                return {"ok": False, "error": err}
+        if not radio.get("uplink"):
             self._unmanage_iface(iface)
             run(["ip", "link", "set", iface, "up"], timeout=3)
         freqs: list[int] = []
@@ -2201,7 +2621,11 @@ class RadioLab:
             cmd = ["iw", "dev", iface, "scan", "freq"] + [str(f) for f in freqs]
             while not stop.is_set() and not self.stop.is_set():
                 code, out, err = run(cmd, timeout=timeout)
-                aps = parse_scan_dump(out) if code == 0 else []
+                try:
+                    aps = parse_scan_dump(out) if code == 0 else []
+                except Exception:
+                    aps = []
+                    err = err or "scan parse error"
                 with self.lock:
                     st = self._radio(phy)
                     st["last_scan"] = len(aps)
@@ -2287,26 +2711,40 @@ class RadioLab:
         channel = int(req.get("channel") or 0)
         band = infer_band(channel, str(req.get("band") or ""), req.get("freq") or None)
         mhz = int(req.get("freq") or req.get("mhz") or 0) or (freq_of_channel(channel, band) or 0)
-        channels = req.get("channels") or []
-        if isinstance(channels, str):
-            channels = [int(x) for x in re.split(r"[,\s]+", channels) if x]
-        channels = [int(c) for c in channels if int(c) > 0]
+        channels = channel_list(req.get("channels") or [])
         inventory = collect_inventory({"radios": self.radios})
         radio = next((r for r in inventory["radios"] if r["phy"] == phy), None)
         if radio is None:
             return {"ok": False, "error": f"unknown phy {phy}"}
         iface = radio.get("station_iface") or self._station_name(radio) or ""
-        if not iface:
-            return {"ok": False, "error": f"no station interface on {phy} for active scan"}
-        if radio.get("lab") or radio.get("bus") == "usb":
+        if not iface or not iface_exists(iface):
+            iface, err = self._ensure_station_iface(phy, radio)
+            if err:
+                return {"ok": False, "error": err}
+        if not radio.get("uplink"):
             self._unmanage_iface(iface)
             run(["ip", "link", "set", iface, "up"], timeout=3)
         if not channel and channels:
             channel = channels[0]
             mhz = freq_of_channel(channel, band) or mhz
         if not channel and not mhz:
-            channel = 6 if "2.4" in (radio.get("bands") or []) else 36
-            band = "2.4" if channel <= 14 else "5"
+            bands = radio.get("bands") or []
+            caps = (radio.get("capabilities") or {}).get("channels") or {}
+            if "2.4" in bands:
+                band = "2.4"
+                available = caps.get("2.4") or []
+                channel = 6 if 6 in available else (available[0] if available else 6)
+            elif "5" in bands:
+                band = "5"
+                available = caps.get("5") or []
+                channel = 36 if 36 in available else (available[0] if available else 36)
+            elif "6" in bands:
+                band = "6"
+                available = caps.get("6") or []
+                channel = 69 if 69 in available else (available[0] if available else 5)
+            else:
+                channel = 1
+                band = "2.4"
             mhz = freq_of_channel(channel, band) or 0
         self._drop_fake_monitor(radio)
         self._stop_scan(phy)
@@ -2340,7 +2778,11 @@ class RadioLab:
                         ["iw", "dev", iface, "scan", "freq", str(int(freq))],
                         timeout=8,
                     )
-                    aps = parse_scan_dump(out) if code == 0 else []
+                    try:
+                        aps = parse_scan_dump(out) if code == 0 else []
+                    except Exception:
+                        aps = []
+                        err = err or "scan parse error"
                     with self.lock:
                         st = self._radio(phy)
                         st["channel"] = ch
@@ -2397,9 +2839,11 @@ class RadioLab:
                 armed = self.active_scan_start(req)
                 if not armed.get("ok"):
                     return armed
-            iface = radio.get("station_iface") or ""
-            if not iface:
-                return {"ok": False, "error": "no station interface for active capture"}
+            iface = radio.get("station_iface") or self._station_name(radio) or ""
+            if not iface or not iface_exists(iface):
+                iface, err = self._ensure_station_iface(phy, radio)
+                if err:
+                    return {"ok": False, "error": err}
             state = self.radios.get(phy) or {}
             channel = int(req.get("channel") or state.get("channel") or 0)
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2441,27 +2885,56 @@ class RadioLab:
             return {"ok": False, "error": "no monitor iface to capture"}
         if not phy:
             phy = self.phy_of_iface(iface) or "phy"
-        if iface in self.writers:
-            return {"ok": True, "data": self.snapshot()}
+        self._wake_monitor(iface, phy, set_filter=True)
         state = self.radios.get(phy) or {}
         channel = int(req.get("channel") or state.get("channel") or 0)
+        width = int(req.get("width") or state.get("width") or 20)
+        band = str(req.get("band") or state.get("band") or "")
+        mhz = state.get("freq") or None
+        if channel:
+            code, used_width, message = self._tune(iface, channel, width, band, mhz)
+            with self.lock:
+                st = self._radio(phy)
+                if code == 0:
+                    st["channel"] = channel
+                    st["width"] = used_width
+                    if band:
+                        st["band"] = band
+                    st["error"] = ""
+                elif message:
+                    st["error"] = message
+        if iface in self.writers:
+            return {"ok": True, "data": self.snapshot()}
         hopping = bool(state.get("hop_channels"))
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         ch_part = "hop" if hopping else f"ch{channel or 'x'}"
         name = f"{stamp}_{phy}_{iface}_{ch_part}.pcap"
         path = self.capture_dir / name
-        writer = PcapWriter(path, dlt=iface_pcap_dlt(iface), kind="live")
+        writer = PcapWriter(path, dlt=iface_pcap_dlt(iface) or DLT_IEEE802_11_RADIO, kind="live")
         try:
             os.chown(path, self.allow_uid, -1)
         except OSError:
             pass
+        self._stop_sniffer(iface)
+        time.sleep(0.08)
         self.writers[iface] = writer
         self.ensure_sniffer(iface)
+        before = iface_rx_packets(iface)
+        time.sleep(1.0)
+        after = iface_rx_packets(iface)
         with self.lock:
             radio = self._radio(phy)
             radio["capturing"] = True
             radio["capture_iface"] = iface
             radio["capture_path"] = str(path)
+            if after <= before:
+                known = any(
+                    int(ap.get("channel") or 0) == channel
+                    and (not band or str(ap.get("band") or "") == band)
+                    for ap in self.air.values()
+                )
+                if known:
+                    radio["error"] = "monitor RX is silent on a channel with known traffic"
         return {"ok": True, "data": self.snapshot()}
 
     def capture_stop(self, req: dict) -> dict:
@@ -2508,7 +2981,10 @@ class RadioLab:
         code, out, err = run(["iw", "dev", iface, "scan", "dump"], timeout=12)
         if code != 0:
             return {"ok": False, "error": (err or out).strip()}
-        aps = parse_scan_dump(out)
+        try:
+            aps = parse_scan_dump(out)
+        except Exception as exc:
+            return {"ok": False, "error": f"scan parse error: {exc}"}
         return {"ok": True, "data": {"aps": aps}}
 
     def ensure_sniffer(self, iface: str) -> None:
@@ -2521,6 +2997,7 @@ class RadioLab:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
             sock.bind((iface, 0))
             sock.settimeout(0.4)
+            packet_set_promisc(sock, iface)
             return sock
 
         def sock_dlt(sock: socket.socket) -> int:
@@ -2560,17 +3037,23 @@ class RadioLab:
                     if not packet:
                         continue
                     writer = self.writers.get(iface)
-                    if writer and writer.kind == "live" and writer.dlt == dlt:
-                        writer.write(packet)
-                    if dlt != DLT_IEEE802_11_RADIO:
-                        continue
+                    if writer and writer.kind == "live":
+                        try:
+                            if dlt:
+                                writer.ensure_dlt(dlt)
+                            writer.write(packet)
+                        except (OSError, ValueError):
+                            pass
                     rt = parse_radiotap(packet)
                     if not rt:
                         continue
                     frame = packet[rt["length"]:]
-                    parsed = parse_mgmt_frame(frame, rt)
-                    if parsed:
-                        self.ingest(iface, parsed)
+                    try:
+                        parsed = parse_mgmt_frame(frame, rt)
+                        if parsed:
+                            self.ingest(iface, parsed)
+                    except Exception:
+                        continue
             finally:
                 if sock is not None:
                     try:
@@ -2597,10 +3080,11 @@ class RadioLab:
                     rssi = prev.get("rssi")
                 elif prev.get("rssi") is not None:
                     rssi = round((prev["rssi"] * 0.6) + (rssi * 0.4), 1)
+                ssid = prefer_ssid(parsed.get("ssid"), prev.get("ssid"))
                 entry = {
                     "bssid": key,
-                    "ssid": parsed.get("ssid") if parsed.get("ssid") not in (None, "") else prev.get("ssid") or "",
-                    "hidden": bool(parsed.get("hidden") and not (parsed.get("ssid") or prev.get("ssid"))),
+                    "ssid": ssid,
+                    "hidden": not ssid,
                     "channel": parsed.get("channel") or prev.get("channel") or 0,
                     "freq": parsed.get("freq") or prev.get("freq") or 0,
                     "band": parsed.get("band") or prev.get("band") or "",
@@ -2653,7 +3137,11 @@ class RadioLab:
         Path(self.sock_path).parent.mkdir(parents=True, exist_ok=True)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(self.sock_path)
-        os.chmod(self.sock_path, 0o666)
+        try:
+            os.chown(self.sock_path, self.allow_uid, -1)
+        except OSError:
+            pass
+        os.chmod(self.sock_path, 0o600)
         sock.listen(16)
         sock.settimeout(0.5)
         self.adopt()
@@ -2661,7 +3149,10 @@ class RadioLab:
 
         def status_loop() -> None:
             while not self.stop.is_set():
-                self.persist_status()
+                try:
+                    self.persist_status()
+                except Exception:
+                    pass
                 self.stop.wait(1.2)
 
         threading.Thread(target=status_loop, name="status", daemon=True).start()
@@ -2706,7 +3197,24 @@ class RadioLab:
                 if self.stop.is_set():
                     break
                 continue
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+            if not self.client_slots.acquire(blocking=False):
+                try:
+                    conn.sendall(b'{"ok":false,"error":"busy"}\n')
+                except OSError:
+                    pass
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+
+            def run(client=conn) -> None:
+                try:
+                    handle_client(client)
+                finally:
+                    self.client_slots.release()
+
+            threading.Thread(target=run, name="rpc", daemon=True).start()
         try:
             sock.close()
         except OSError:
@@ -2791,7 +3299,11 @@ def parse_scan_dump(text: str) -> list[dict]:
     for line in text.splitlines():
         if line.startswith("BSS "):
             close_current()
-            bssid = line.split()[1].split("(")[0]
+            parts = line.split()
+            if len(parts) < 2:
+                current = None
+                continue
+            bssid = parts[1].split("(")[0]
             current = {"bssid": mac_colon(bssid), "ssid": "", "freq": 0, "channel": 0, "rssi": None, "security": "", "width": 20}
             ht40 = False
             vht_code = None
@@ -2819,7 +3331,9 @@ def parse_scan_dump(text: str) -> list[dict]:
             except (IndexError, ValueError):
                 pass
         elif stripped.startswith("SSID:"):
-            current["ssid"] = stripped[5:].strip()
+            raw = stripped[5:].strip()
+            decoded = decode_ssid(raw.encode("utf-8", "replace"))
+            current["ssid"] = "" if decoded is None else decoded
         elif stripped.startswith("DS Parameter set: channel"):
             try:
                 current["channel"] = int(stripped.split()[-1])
@@ -2888,6 +3402,8 @@ def rpc(cmd: str, payload: dict | None = None, sock_path: str = DEFAULT_SOCKET, 
         return {"ok": False, "error": "helper_not_running"}
     except TimeoutError:
         return {"ok": False, "error": "helper timed out"}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"ok": False, "error": "invalid helper reply"}
     except OSError as exc:
         if getattr(exc, "errno", None) in (111, 2):
             return {"ok": False, "error": "helper_not_running"}
@@ -2994,9 +3510,7 @@ def run_daemon(allow_uid: int, capture_dir: str, sock_path: str, fork: bool) -> 
 
 
 def parse_channels(value: str | None) -> list[int]:
-    if not value:
-        return []
-    return [int(part) for part in re.split(r"[,\s]+", value) if part]
+    return channel_list(value)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3136,7 +3650,13 @@ def uid_to_home(uid: int) -> str:
         import pwd
         return pwd.getpwuid(uid).pw_dir
     except Exception:
-        return f"/home/{os.environ.get('SUDO_USER') or os.environ.get('USER') or 'patrick'}"
+        env_home = os.environ.get("HOME") or ""
+        if env_home:
+            return env_home
+        user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+        if user:
+            return f"/home/{user}"
+        return "/root"
 
 
 if __name__ == "__main__":
