@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "patrick.radio-lab"
-  ipcTarget: "patrick.radio-lab"
+  moduleName: "radio-lab"
+  ipcTarget: "radio-lab"
   manageIpc: false
 
   property string focusSection: "header"

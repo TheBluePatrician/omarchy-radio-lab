@@ -32,7 +32,7 @@ Item {
   readonly property string pluginDir: {
     var resolved = urlToPath(Qt.resolvedUrl("."))
     if (resolved && resolved.charAt(0) === "/") return resolved
-    return Quickshell.env("HOME") + "/.config/omarchy/plugins/patrick.radio-lab"
+    return Quickshell.env("HOME") + "/.config/omarchy/plugins/radio-lab"
   }
   readonly property string ctl: {
     var resolved = urlToPath(Qt.resolvedUrl("bin/wnic-ctl"))
@@ -235,7 +235,7 @@ Item {
       return
     }
     var parsed = Model.parseStatus(text)
-    if (parsed && parsed.plugin === "patrick.radio-lab" && Array.isArray(parsed.radios))
+    if (parsed && parsed.plugin === "radio-lab" && Array.isArray(parsed.radios))
       status = parsed
     var kind = pendingKind
     if (parsed && parsed.needs_steal && pendingPhy) {

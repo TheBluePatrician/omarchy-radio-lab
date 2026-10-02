@@ -11,15 +11,15 @@ License: MIT. Passive monitoring only — no injection, deauth, or cracking.
 omarchy plugin add https://github.com/TheBluePatrician/omarchy-radio-lab.git --enable
 ```
 
-That clones the plugin into `~/.config/omarchy/plugins/patrick.radio-lab`
+That clones the plugin into `~/.config/omarchy/plugins/radio-lab`
 and enables the bar widget. Then open the panel and click **Install** (or
 run the helper installer once):
 
 ```
-pkexec ~/.config/omarchy/plugins/patrick.radio-lab/bin/install.sh
+pkexec ~/.config/omarchy/plugins/radio-lab/bin/install.sh
 ```
 
-Update later with `omarchy plugin update patrick.radio-lab`.
+Update later with `omarchy plugin update radio-lab`.
 
 The stock `omarchy.network` widget stays in charge of joining Wi-Fi and
 picking which radio is the internet path. Radio Lab is the extra radios:
@@ -29,8 +29,8 @@ NIC back to NetworkManager so the network panel can use it.
 ## Remove
 
 ```
-pkexec ~/.config/omarchy/plugins/patrick.radio-lab/bin/uninstall.sh
-omarchy plugin remove patrick.radio-lab
+pkexec ~/.config/omarchy/plugins/radio-lab/bin/uninstall.sh
+omarchy plugin remove radio-lab
 ```
 
 Uninstall stops the helper and removes `/usr/local/lib/radio-lab`, the
@@ -61,7 +61,7 @@ helper (`wnicd`). The panel's **Install** / **Start** button runs that
 once via polkit.
 
 ```
-pkexec ~/.config/omarchy/plugins/patrick.radio-lab/bin/install.sh
+pkexec ~/.config/omarchy/plugins/radio-lab/bin/install.sh
 ```
 
 That installs `/usr/local/lib/radio-lab/wnicd`, a `wnicd.service`, and

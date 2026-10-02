@@ -24,7 +24,7 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
-PLUGIN_ID = "patrick.radio-lab"
+PLUGIN_ID = "radio-lab"
 RLAB_PREFIX = "rlab"
 DEFAULT_SOCKET = "/run/wnicd/control.sock"
 DEFAULT_STATUS = "/run/wnicd/status.json"

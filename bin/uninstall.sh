@@ -20,4 +20,4 @@ systemctl daemon-reload 2>/dev/null || true
 
 echo "Radio Lab helper removed."
 echo "Captures in ~/radio-lab/captures were left in place."
-echo "Remove the bar widget with: omarchy plugin remove patrick.radio-lab"
+echo "Remove the bar widget with: omarchy plugin remove radio-lab"
