@@ -10,7 +10,9 @@ Item {
   property var settings: ({})
   property var status: Model.emptyStatus()
   property bool refreshing: false
-  property bool busy: statusProc.running || actionProc.running || helperProc.running
+  // Status polls every few seconds. Counting them as busy disables every
+  // button for the whole `iw` round-trip.
+  property bool busy: actionProc.running || helperProc.running
   property string lastError: ""
   property string actionStatus: ""
   property string pendingPhy: ""
@@ -136,12 +138,13 @@ Item {
     runCtl(["scan-stop", phy])
   }
 
-  function captureStart(phy, steal, channel, band) {
+  function captureStart(phy, steal, channel, band, width) {
     pendingPhy = phy
     pendingKind = "capture"
     var args = ["capture-start", phy]
     if (steal) args.push("--steal")
     if (channel) args.push("--channel", String(channel))
+    if (width) args.push("--width", String(width))
     if (band) args.push("--band", String(band))
     runCtl(args)
   }

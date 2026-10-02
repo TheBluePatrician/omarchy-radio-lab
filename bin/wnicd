@@ -256,6 +256,7 @@ CHIPSETS = {
     "8086:2723": "Intel AX200",
     "8086:51F0": "Intel AX211",
     "8086:7E40": "Intel BE201",
+    "8086:E440": "Intel Core Ultra CNVi",
     "14E4:43A0": "Broadcom BCM4360",
     "0BDA:8812": "RTL8812AU",
     "0BDA:881A": "RTL8812AU",
@@ -1146,17 +1147,21 @@ def _he_op_width(data: bytes) -> int:
 
 
 def mpdu_without_fcs(frame: bytes, has_fcs: bool = False) -> bytes | None:
-    """Strip an 802.11 FCS when present. Drop the frame if radiotap said FCS and it is bad."""
+    """Strip an 802.11 FCS only when radiotap says it is present.
+
+    A matching CRC on a frame the driver already stripped is not proof of an
+    FCS. Stripping those four bytes cuts into the beacon IEs and corrupts SSIDs.
+    """
+    if not has_fcs:
+        return frame
     if len(frame) < 4:
-        return None if has_fcs else frame
+        return None
     body = frame[:-4]
     got = struct.unpack("<I", frame[-4:])[0]
     calc = zlib.crc32(body) & 0xFFFFFFFF
-    if calc == got:
-        return body
-    if has_fcs:
+    if calc != got:
         return None
-    return frame
+    return body
 
 
 def is_unicast_mac(mac: str) -> bool:
@@ -1174,6 +1179,28 @@ def is_unicast_mac(mac: str) -> bool:
     return True
 
 
+def unescape_iw_bytes(text: str) -> bytes:
+    """Turn iw's `\\xNN` escapes back into the original SSID bytes.
+
+    iw prints non-printable bytes, backslashes, and leading or trailing spaces
+    as `\\xNN`. A real backslash is itself escaped, so every `\\x` is an escape.
+    """
+    out = bytearray()
+    i = 0
+    raw = str(text or "")
+    while i < len(raw):
+        if raw[i] == "\\" and i + 3 < len(raw) and raw[i + 1] == "x":
+            try:
+                out.append(int(raw[i + 2:i + 4], 16))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        out.extend(raw[i].encode("utf-8"))
+        i += 1
+    return bytes(out)
+
+
 def decode_ssid(data: bytes) -> str | None:
     """SSID from an IE payload. None = invalid (ignore). Empty string = hidden."""
     if len(data) > 32:
@@ -1187,7 +1214,8 @@ def decode_ssid(data: bytes) -> str | None:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         text = data.decode("utf-8", errors="replace")
-        if text.count("\ufffd") > max(1, len(text) // 4):
+        # One bad byte is enough to invent a lookalike SSID ("Tu�cne").
+        if "\ufffd" in text:
             return None
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
         return None
@@ -1312,6 +1340,11 @@ def parse_mgmt_frame(frame: bytes, rt: dict) -> dict | None:
     if ftype != 0:
         return None
     if fc & 0x4000:
+        return None
+    # mt76 delivers frames that failed the FCS check with the radiotap
+    # "bad FCS" flag and the checksum already stripped. Parsing those
+    # invents SSIDs and clients from bit errors.
+    if int(rt.get("flags") or 0) & 0x40:
         return None
     hdr_len = 24
     if fc & 0x8000:
@@ -1558,6 +1591,28 @@ def collect_inventory(extra: dict | None = None) -> dict:
                 role = "station"
         passive = supports_passive_monitor(sysfs, info)
         caps = build_capabilities(info, radio_extra.get("learned_width") or {}, sysfs.get("driver") or "")
+        live_channel = int((live or {}).get("channel") or 0)
+        live_width = int((live or {}).get("width") or 0)
+        live_band = str((live or {}).get("band") or "")
+        live_freq = float((live or {}).get("freq") or 0)
+        # A tuned interface is the truth. An idle station must not keep the
+        # first channel of the last scan, or the panel looks parked and the
+        # next capture jumps there.
+        if live_freq:
+            shown_channel = live_channel
+            shown_width = live_width
+            shown_band = live_band
+            shown_freq = live_freq
+        elif role == "station":
+            shown_channel = 0
+            shown_width = 0
+            shown_band = ""
+            shown_freq = 0
+        else:
+            shown_channel = int(radio_extra.get("channel") or 0) or live_channel
+            shown_width = int(radio_extra.get("width") or 0) or live_width
+            shown_band = str(radio_extra.get("band") or "") or live_band
+            shown_freq = radio_extra.get("freq") or live_freq or 0
         caps["passive_monitor"] = passive
         station_name = (station or {}).get("iface", "")
         error = radio_extra.get("error", "") or ""
@@ -1581,10 +1636,10 @@ def collect_inventory(extra: dict | None = None) -> dict:
             "station_iface": (station or {}).get("iface", ""),
             "monitor_iface": (monitor or {}).get("iface", "") or radio_extra.get("monitor_iface", ""),
             "role": role,
-            "channel": radio_extra.get("channel") or (live or {}).get("channel") or 0,
-            "width": radio_extra.get("width") or (live or {}).get("width") or 0,
-            "band": radio_extra.get("band") or (live or {}).get("band") or "",
-            "freq": radio_extra.get("freq") or (live or {}).get("freq") or 0,
+            "channel": shown_channel,
+            "width": shown_width,
+            "band": shown_band,
+            "freq": shown_freq,
             "ssid": (station or {}).get("ssid", ""),
             "capturing": bool(radio_extra.get("capturing")),
             "capture_path": radio_extra.get("capture_path", ""),
@@ -1621,7 +1676,7 @@ def collect_inventory(extra: dict | None = None) -> dict:
         "helper": helper,
         "capture_dir": extra.get("capture_dir") or default_capture_dir(),
         "radio_count": len(radios),
-        "monitor_count": sum(1 for r in radios if r["role"] in ("monitor", "hopper")),
+        "monitor_count": sum(1 for r in radios if r["role"] in ("monitor", "hopper", "active")),
         "capture_count": sum(1 for r in radios if r["capturing"]),
         "station_count": sum(1 for r in radios if r["role"] == "station" and r.get("ssid")),
         "radios": radios,
@@ -2065,6 +2120,11 @@ class RadioLab:
         self._wake_monitor(name, set_filter=True)
         return None
 
+    def _clear_promisc(self, name: str) -> None:
+        """Monitor mode turns promiscuous on. A station should not stay that way."""
+        if name and iface_exists(name):
+            run(["ip", "link", "set", name, "promisc", "off"])
+
     def _convert_to_managed(self, name: str, up: bool = True) -> str:
         if not name or not iface_exists(name):
             return ""
@@ -2075,6 +2135,7 @@ class RadioLab:
             if conv[0] != 0:
                 return (conv[2] or conv[1] or f"could not restore {name}").strip()
         run(["ip", "addr", "flush", "dev", name])
+        self._clear_promisc(name)
         if up:
             run(["ip", "link", "set", name, "up"])
         else:
@@ -2176,6 +2237,7 @@ class RadioLab:
 
         if target and iface_exists(target):
             run(["ip", "addr", "flush", "dev", target])
+            self._clear_promisc(target)
             if connect_uplink and radio.get("uplink"):
                 join = self._remanage_iface(target, connect=True)
                 err = err or join
@@ -2199,9 +2261,9 @@ class RadioLab:
                 state["original_iface"] = original
             state["capturing"] = False
             state["capture_path"] = ""
-            state["hop_channels"] = []
             state["note"] = ""
             state["error"] = err
+            self._clear_idle_tune(state)
         return err
 
     def monitor_off(self, req: dict) -> dict:
@@ -2275,6 +2337,7 @@ class RadioLab:
             if conv[0] != 0:
                 return (conv[2] or conv[1] or f"could not restore {iface}").strip()
         run(["nmcli", "device", "set", iface, "managed", "yes"])
+        self._clear_promisc(iface)
         run(["ip", "link", "set", iface, "up"])
         self._wait_nm_available(iface)
         if not connect:
@@ -2291,6 +2354,10 @@ class RadioLab:
                 self._wait_nm_available(iface)
                 continue
             break
+        # Never clone a profile that is pinned to another live NIC. Doing that
+        # joins the lab stick to the internet SSID and can add a second default
+        # route. A profile pinned to an interface that is gone (USB port changed)
+        # can move onto this iface.
         code, listing, _ = run(["nmcli", "-t", "-f", "NAME,UUID,TYPE,DEVICE", "connection", "show"])
         profiles = []
         if code == 0:
@@ -2298,10 +2365,16 @@ class RadioLab:
                 parts = line.split(":")
                 if len(parts) < 3 or parts[2] != "802-11-wireless":
                     continue
-                name, uuid, dev = parts[0], parts[1], parts[3] if len(parts) > 3 else ""
-                profiles.append((0 if dev == iface else 1, name, uuid))
+                name, uuid = parts[0], parts[1]
+                bound = self._profile_iface(uuid)
+                if bound and bound != iface and iface_exists(bound):
+                    continue
+                dev = parts[3] if len(parts) > 3 else ""
+                profiles.append((0 if dev == iface or bound == iface else 1, name, uuid, bound))
             profiles.sort()
-        for _rank, name, uuid in profiles:
+        for _rank, name, uuid, bound in profiles:
+            if bound and bound != iface:
+                run(["nmcli", "connection", "modify", uuid, "connection.interface-name", iface])
             err_text = self._up_wifi_profile(name, uuid, iface)
             if self._nm_wifi_state(iface) == "connected":
                 return ""
@@ -2314,24 +2387,23 @@ class RadioLab:
                 last = err_text or last
         if self._nm_wifi_state(iface) == "connected":
             return ""
+        # Handed back to NetworkManager with nothing of its own to join.
+        # That is a clean lab NIC, not a failed restore.
+        if self._nm_wifi_state(iface) in ("disconnected", "unavailable", "connecting", ""):
+            return ""
         return last or f"could not associate {iface}"
 
-    def _up_wifi_profile(self, name: str, uuid: str, iface: str) -> str:
+    def _profile_iface(self, uuid: str) -> str:
         code, bound, _ = run(["nmcli", "-g", "connection.interface-name", "connection", "show", uuid])
-        bound_name = (bound or "").strip()
-        target = name
-        if bound_name and bound_name != iface:
-            clone = f"{name} on {iface}"
-            run(["nmcli", "connection", "delete", clone])
-            cloned = run(["nmcli", "connection", "clone", uuid, clone])
-            if cloned[0] != 0:
-                return (cloned[2] or cloned[1] or f"could not clone {name} for {iface}").strip()
-            run(["nmcli", "connection", "modify", clone, "connection.interface-name", iface])
-            target = clone
-        code, out, err = run(["nmcli", "-w", "20", "connection", "up", target, "ifname", iface], timeout=25)
+        if code != 0:
+            return ""
+        return (bound or "").strip()
+
+    def _up_wifi_profile(self, name: str, uuid: str, iface: str) -> str:
+        code, out, err = run(["nmcli", "-w", "20", "connection", "up", uuid, "ifname", iface], timeout=25)
         if code == 0:
             return ""
-        return (err or out).strip()
+        return (err or out or f"could not connect {name}").strip()
 
     def _station_name(self, radio: dict) -> str:
         for key in ("station_iface", "converted_iface", "original_iface", "stolen_iface", "silenced_iface"):
@@ -2369,7 +2441,13 @@ class RadioLab:
             iface, err = self._ensure_station_iface(phy, merged)
             if err:
                 return err
-        return self._remanage_iface(iface, connect=True)
+        err = self._remanage_iface(iface, connect=True)
+        if not err and iface_exists(iface) and self._nm_wifi_state(iface) != "connected":
+            with self.lock:
+                state = self._radio(phy)
+                if not state.get("note"):
+                    state["note"] = "Back in Wi-Fi, not joined to a network"
+        return err
 
     def restore_wifi(self, req: dict) -> dict:
         phy = str(req.get("phy") or "")
@@ -2447,6 +2525,7 @@ class RadioLab:
         if iface and self._iface_type(iface) == "monitor":
             err = self._convert_to_managed(iface, up=True)
         elif iface and iface_exists(iface):
+            self._clear_promisc(iface)
             run(["ip", "link", "set", iface, "up"])
             err = ""
         else:
@@ -2585,7 +2664,8 @@ class RadioLab:
             iface, err = self._ensure_station_iface(phy, radio)
             if err:
                 return {"ok": False, "error": err}
-        if not radio.get("uplink"):
+        uplink = bool(radio.get("uplink"))
+        if not uplink:
             self._unmanage_iface(iface)
             run(["ip", "link", "set", iface, "up"], timeout=3)
         freqs: list[int] = []
@@ -2652,20 +2732,54 @@ class RadioLab:
                         "width": ap.get("width") or 20,
                     })
                 self._log_scan_aps(phy, iface, aps, {"band": band, "channels": channels})
+                if uplink:
+                    # One pass on the internet radio. Looping `iw scan` keeps
+                    # the NIC off-channel and stalls the link. A connected
+                    # station hides `error` in the snapshot, so the outcome
+                    # also lives in `note`.
+                    if not stop.is_set():
+                        with self.lock:
+                            st = self._radio(phy)
+                            st["role"] = "station"
+                            if code == 0:
+                                st["note"] = f"Heard {len(aps)} networks"
+                            elif st.get("error"):
+                                st["note"] = st["error"]
+                            self._clear_idle_tune(st)
+                    self.scanners.pop(phy, None)
+                    return
                 stop.wait(0.5)
 
         threading.Thread(target=loop, name=f"scan-{phy}", daemon=True).start()
         return {"ok": True, "data": self.snapshot()}
+
+    def _clear_idle_tune(self, state: dict) -> None:
+        """Drop a scan or park target once this radio is a station again.
+
+        The stored channel is not a frequency the interface is on. Leaving it
+        set makes an idle USB NIC look tuned, and capture-start will retune
+        to that leftover channel.
+        """
+        state["channel"] = 0
+        state["width"] = 0
+        state["band"] = ""
+        state["freq"] = 0
+        state["hop_band"] = ""
+        state["hop_channels"] = []
 
     def hop_stop(self, req: dict) -> dict:
         phy = str(req.get("phy") or "")
         self._stop_scan(phy)
         with self.lock:
             if phy in self.radios:
-                self.radios[phy]["role"] = "monitor" if self.radios[phy].get("monitor_iface") else "station"
-                self.radios[phy]["hop_channels"] = []
-                self.radios[phy]["hop_band"] = ""
-                self.radios[phy]["note"] = ""
+                st = self.radios[phy]
+                st["role"] = "monitor" if st.get("monitor_iface") else "station"
+                st["note"] = ""
+                if st["role"] == "monitor":
+                    st["hop_channels"] = []
+                    st["hop_band"] = ""
+                else:
+                    self._clear_idle_tune(st)
         return {"ok": True, "data": self.snapshot()}
 
     def _log_scan_aps(self, phy: str, iface: str, aps: list[dict], extra: dict) -> None:
@@ -2825,9 +2939,10 @@ class RadioLab:
         self._stop_scan(phy)
         with self.lock:
             if phy in self.radios:
-                self.radios[phy]["role"] = "station"
-                self.radios[phy]["hop_channels"] = []
-                self.radios[phy]["note"] = ""
+                st = self.radios[phy]
+                st["role"] = "station"
+                st["note"] = ""
+                self._clear_idle_tune(st)
         return {"ok": True, "data": self.snapshot()}
 
     def capture_start(self, req: dict) -> dict:
@@ -3331,14 +3446,19 @@ def parse_scan_dump(text: str) -> list[dict]:
             except (IndexError, ValueError):
                 pass
         elif stripped.startswith("SSID:"):
-            raw = stripped[5:].strip()
-            decoded = decode_ssid(raw.encode("utf-8", "replace"))
+            decoded = decode_ssid(unescape_iw_bytes(stripped[5:].strip()))
             current["ssid"] = "" if decoded is None else decoded
         elif stripped.startswith("DS Parameter set: channel"):
-            try:
-                current["channel"] = int(stripped.split()[-1])
-            except ValueError:
+            # 6 GHz channel numbers overlap 1–14. Frequency already mapped the
+            # real channel; a DS parameter here is a 2.4/5 field and would
+            # file the BSS on the wrong band.
+            if current.get("band") == "6":
                 pass
+            else:
+                try:
+                    current["channel"] = int(stripped.split()[-1])
+                except ValueError:
+                    pass
         elif "RSN:" in stripped:
             current["security"] = "WPA2/WPA3"
         elif stripped.startswith("WPA:"):
@@ -3561,6 +3681,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("phy")
     p.add_argument("--steal", action="store_true")
     p.add_argument("--channel", type=int, default=0)
+    p.add_argument("--width", type=int, default=0)
     p.add_argument("--band", default="")
     p = sub.add_parser("capture-stop")
     p.add_argument("phy")
@@ -3618,6 +3739,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = {"phy": args.phy, "steal": args.steal}
         if args.channel:
             payload["channel"] = args.channel
+        if args.width:
+            payload["width"] = args.width
         if args.band:
             payload["band"] = args.band
         return privileged("capture_start", payload, pretty)

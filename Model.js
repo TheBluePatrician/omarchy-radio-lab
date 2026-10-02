@@ -535,11 +535,39 @@ function ssidLabel(row) {
   var cleaned = ""
   for (var i = 0; i < ssid.length && cleaned.length < 32; i++) {
     var c = ssid.charCodeAt(i)
-    if (c < 32 || c === 127) continue
+    if (c < 32 || c === 127 || c === 0xFFFD) continue
     cleaned += ssid.charAt(i)
   }
   if (!cleaned) return "(hidden)"
   return cleaned
+}
+
+function visibleCaptures(captures) {
+  var rows = Array.isArray(captures) ? captures : []
+  var pcaps = {}
+  for (var i = 0; i < rows.length; i++) {
+    var name = String((rows[i] && rows[i].name) || "")
+    if (name.slice(-5) === ".pcap") pcaps[name.slice(0, -5)] = true
+  }
+  var out = []
+  for (var j = 0; j < rows.length; j++) {
+    var item = rows[j] || {}
+    var itemName = String(item.name || "")
+    if (itemName.slice(-6) === ".jsonl" && pcaps[itemName.slice(0, -6)]) continue
+    out.push(item)
+  }
+  return out
+}
+
+function clientLabel(row) {
+  if (!row) return ""
+  var list = row.ssids || []
+  var names = []
+  for (var i = 0; i < list.length; i++) {
+    var name = ssidLabel({ ssid: list[i] })
+    if (name && name !== "(hidden)") names.push(name)
+  }
+  return names.length ? names.join(", ") : "(no probe)"
 }
 
 function captureName(path) {
@@ -624,6 +652,8 @@ if (typeof module !== "undefined") {
     clientRows: clientRows,
     ssidLabel: ssidLabel,
     captureName: captureName,
+    visibleCaptures: visibleCaptures,
+    clientLabel: clientLabel,
     relativeTime: relativeTime,
     barBadge: barBadge,
     barMode: barMode,

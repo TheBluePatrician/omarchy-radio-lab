@@ -49,7 +49,8 @@ Panel {
     return false
   }
   readonly property var airRows: lab.air
-  readonly property var captureRows: lab.captures
+  readonly property var captureRows: Model.visibleCaptures(lab.captures)
+  readonly property var clientRows: lab.clients || []
   readonly property bool helperReady: lab.helperReady
   readonly property string helperState: lab.helperState
   readonly property var activePhrases: [
@@ -166,16 +167,30 @@ Panel {
 
   function nudgeChannel(dx) {
     var radio = selectedRadio()
-    if (!radio || !helperReady) return
-    var presets = Model.channelPresets(radio)
+    if (!radio || !helperReady || isLocked(radio)) return
+    var presets = Model.channelPresets(radio, bandFor(radio))
     if (!presets.length) return
-    var idx = 0
+    var idx = -1
     for (var i = 0; i < presets.length; i++) {
       if (Number(presets[i].channel) === Number(radio.channel) && String(presets[i].band) === String(radio.band || presets[i].band))
         idx = i
     }
+    if (idx < 0) idx = dx > 0 ? -1 : presets.length
     idx = Math.max(0, Math.min(presets.length - 1, idx + dx))
-    parkOn(radio, presets[idx].channel, radio.width || 20, presets[idx].band)
+    parkOn(radio, presets[idx].channel, radio.width || Model.parkWidth(radio, presets[idx].band), presets[idx].band)
+  }
+
+  function bandScanning(band) {
+    for (var i = 0; i < radios.length; i++) {
+      if (Model.scanningBand(radios[i], band)) return true
+    }
+    return false
+  }
+
+  function setAirCursor(index) {
+    cursorActive = true
+    focusSection = "air"
+    airIndex = index
   }
 
   function activateCursor() {
@@ -187,6 +202,15 @@ Panel {
     if (focusSection === "radios") {
       var radio = selectedRadio()
       if (radio) toggleMonitor(radio)
+      return
+    }
+    if (focusSection === "air") {
+      var ap = airRows[airIndex]
+      var tune = selectedRadio()
+      if (ap && tune) {
+        var apBand = ap.band || Model.airBand(ap)
+        parkOn(tune, ap.channel, Model.parkWidth(tune, apBand), apBand)
+      }
       return
     }
     if (focusSection === "captures") {
@@ -212,7 +236,9 @@ Panel {
     if (radio.role === "monitor") lab.monitorOff(radio.phy)
     else {
       var start = defaultChannel(radio)
-      lab.monitorOn(radio.phy, start.channel, Model.parkWidth(radio, start.band), false, start.band)
+      pendingChannel = start.channel
+      pendingWidth = Model.parkWidth(radio, start.band)
+      lab.monitorOn(radio.phy, start.channel, pendingWidth, false, start.band)
     }
   }
 
@@ -232,10 +258,21 @@ Panel {
       var band = bandFor(radio)
       var pick = Model.preferredChannel(radio, band)
       var ch = (String(radio.band || "") === String(band) && radio.channel) ? radio.channel : pick.channel
+      pendingChannel = ch
+      pendingWidth = Model.parkWidth(radio, pick.band || band)
       lab.captureStart(radio.phy, false, ch, pick.band || band)
       return
     }
-    lab.captureStart(radio.phy, false)
+    if (radio.role === "monitor" && radio.channel) {
+      pendingChannel = radio.channel
+      pendingWidth = radio.width || Model.parkWidth(radio, radio.band || "")
+      lab.captureStart(radio.phy, false)
+      return
+    }
+    var parked = defaultChannel(radio)
+    pendingChannel = parked.channel
+    pendingWidth = Model.parkWidth(radio, parked.band)
+    lab.captureStart(radio.phy, false, parked.channel, parked.band, pendingWidth)
   }
 
   function defaultChannel(radio) {
@@ -270,10 +307,6 @@ Panel {
     var band = bandFor(radio)
     var channels = Model.scanChannels(radio, band)
     if (!channels.length) return
-    if (isLocked(radio)) {
-      requestLabUnlock(radio)
-      return
-    }
     if (Model.scanningBand(radio, band)) {
       lab.scanStop(radio.phy)
       return
@@ -305,7 +338,7 @@ Panel {
     var pick = radio ? defaultChannel(radio) : { channel: pendingChannel || 0, band: "" }
     var channel = pendingChannel || pick.channel
     var width = pendingWidth || (radio ? Model.parkWidth(radio, pick.band) : 20)
-    if (kind === "capture") lab.captureStart(phy, true, channel, pick.band)
+    if (kind === "capture") lab.captureStart(phy, true, channel, pick.band, width)
     else lab.monitorOn(phy, channel, width, true, pick.band)
   }
 
@@ -546,17 +579,69 @@ Panel {
             AirBandBlock {
               band: "2.4"
               rows: lab.air24
+              indexOffset: 0
               showRule: false
+              visible: lab.air24.length > 0 || root.bandScanning("2.4")
             }
             AirBandBlock {
               band: "5"
               rows: lab.air5
-              showRule: true
+              indexOffset: lab.air24.length
+              showRule: lab.air24.length > 0
+              visible: lab.air5.length > 0 || root.bandScanning("5")
             }
             AirBandBlock {
               band: "6"
               rows: lab.air6
-              showRule: true
+              indexOffset: lab.air24.length + lab.air5.length
+              showRule: lab.air24.length > 0 || lab.air5.length > 0
+              visible: lab.air6.length > 0 || root.bandScanning("6")
+            }
+          }
+
+          PanelSeparator { visible: clientRows.length > 0; foreground: root.foreground }
+
+          Column {
+            visible: clientRows.length > 0
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: "CLIENTS · " + clientRows.length
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: clientRows
+              Row {
+                required property var modelData
+                width: column.width
+                spacing: Style.space(8)
+                Text {
+                  width: Style.space(108)
+                  text: modelData.client || "—"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: Math.max(0, parent.width - Style.space(108) - clientRssi.implicitWidth - parent.spacing * 2)
+                  text: Model.clientLabel(modelData)
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+                Text {
+                  id: clientRssi
+                  text: Model.formatRssi(modelData.rssi)
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
             }
           }
 
@@ -729,7 +814,7 @@ Panel {
       }
 
       Text {
-        visible: !card.radio.error && !!(card.radio.note) && (card.radio.role === "hopper" || card.radio.role === "active")
+        visible: !card.radio.error && !!(card.radio.note) && card.radio.note !== "disabled"
         width: parent.width
         text: String(card.radio.note || "")
         color: root.dim
@@ -782,7 +867,7 @@ Panel {
       Text {
         visible: card.labLocked
         width: parent.width
-        text: "Locked so passive monitor cannot drop your internet. Use Active scan on a channel, or the USB NIC for 6 GHz."
+        text: "This radio is your internet link. Scan looks for networks without leaving Wi-Fi. Monitor and capture need Use for lab, or a USB NIC."
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -790,7 +875,7 @@ Panel {
       }
 
       Flow {
-        visible: card.bandChoices.length > 1 && !card.labLocked
+        visible: card.bandChoices.length > 1
         width: parent.width
         spacing: Style.space(6)
 
@@ -807,6 +892,26 @@ Panel {
             enabled: root.helperReady && !lab.busy
             onClicked: root.selectBand(card.radio, modelData)
           }
+        }
+      }
+
+      Flow {
+        visible: card.labLocked && !card.radio.disabled && card.scanChans.length > 0
+        width: parent.width
+        spacing: Style.space(6)
+
+        Button {
+          text: card.scanning ? "Stop scan" : "Scan"
+          fontFamily: root.fontFamily
+          fontSize: Style.font.bodySmall
+          foreground: root.foreground
+          bordered: true
+          selected: card.scanning
+          enabled: root.helperReady && !lab.busy
+          tooltipText: card.scanning
+            ? "Stop the scan"
+            : "Scan the selected band once. Wi-Fi stays connected."
+          onClicked: root.toggleScan(card.radio)
         }
       }
 
@@ -917,10 +1022,16 @@ Panel {
             selected: Number(card.radio.width) === Number(modelData)
             horizontalPadding: Style.space(7)
             verticalPadding: Style.space(3)
-            enabled: root.helperReady && !lab.busy && card.radio.role !== "station"
+            enabled: root.helperReady && !lab.busy
             onClicked: {
-              if (card.radio.channel)
-                lab.setChannel(card.radio.phy, card.radio.channel, modelData, card.radio.band || "")
+              var band = card.focusBand || card.radio.band || ""
+              var channel = Number(card.radio.channel) || 0
+              if (card.radio.role === "station" || !channel) {
+                var pick = Model.preferredChannel(card.radio, band)
+                root.parkOn(card.radio, channel || pick.channel, modelData, band || pick.band)
+                return
+              }
+              lab.setChannel(card.radio.phy, channel, modelData, band)
             }
           }
         }
@@ -933,8 +1044,10 @@ Panel {
   }
 
   component AirBandBlock: Column {
+    id: bandBlock
     property string band: ""
     property var rows: []
+    property int indexOffset: 0
     property bool showRule: false
     width: column.width
     spacing: Style.space(6)
@@ -968,57 +1081,74 @@ Panel {
         width: column.width
         row: modelData
         rowIndex: index
+        airPos: bandBlock.indexOffset + index
       }
     }
   }
 
-  component AirRow: Row {
+  component AirRow: CursorSurface {
     id: air
     property var row: ({})
     property int rowIndex: 0
-    spacing: Style.space(8)
-    height: Math.max(ssidText.implicitHeight, rssiText.implicitHeight)
+    property int airPos: 0
+    hasCursor: root.cursorActive && root.focusSection === "air" && root.airIndex === airPos
+    foreground: root.foreground
+    implicitHeight: airInner.implicitHeight + Style.space(8)
 
-    Text {
-      id: chText
-      width: Style.space(28)
-      text: row.channel ? String(row.channel) : "—"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
+    Row {
+      id: airInner
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(6)
+      anchors.rightMargin: Style.space(6)
+      spacing: Style.space(8)
+
+      Text {
+        id: chText
+        width: Style.space(28)
+        text: row.channel ? String(row.channel) : "—"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        id: widthText
+        width: Style.space(52)
+        text: Model.formatWidth(row.width)
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+      Text {
+        id: ssidText
+        width: Math.max(0, parent.width - chText.width - widthText.width - rssiText.width - secText.width - parent.spacing * 4)
+        text: Model.ssidLabel(row)
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+        wrapMode: Text.NoWrap
+        clip: true
+      }
+      Text {
+        id: secText
+        text: row.security || ""
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+      Text {
+        id: rssiText
+        text: Model.formatRssi(row.rssi)
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
     }
-    Text {
-      id: widthText
-      width: Style.space(52)
-      text: Model.formatWidth(row.width)
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-    }
-    Text {
-      id: ssidText
-      width: Math.max(0, parent.width - chText.width - widthText.width - rssiText.width - secText.width - parent.spacing * 4)
-      text: Model.ssidLabel(row)
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
-      elide: Text.ElideRight
-      wrapMode: Text.NoWrap
-      clip: true
-    }
-    Text {
-      id: secText
-      text: row.security || ""
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-    }
-    Text {
-      id: rssiText
-      text: Model.formatRssi(row.rssi)
-      color: root.foreground
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.bodySmall
+
+    HoverHandler {
+      onHoveredChanged: if (hovered) root.setAirCursor(air.airPos)
     }
   }
 

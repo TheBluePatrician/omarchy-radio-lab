@@ -46,6 +46,15 @@ Item {
         ctx.arc(cx, cy, size * (0.14 + i * 0.16), Math.PI * 1.18, Math.PI * 1.82)
         ctx.stroke()
       }
+      if (root.mode === "monitor" || root.mode === "capture") {
+        var start = Math.PI * 1.18
+        var sweep = start + (Math.PI * 0.64) * root.sweep
+        ctx.beginPath()
+        ctx.strokeStyle = rgb + "0.95)"
+        ctx.moveTo(cx, cy)
+        ctx.lineTo(cx + Math.cos(sweep) * size * 0.62, cy + Math.sin(sweep) * size * 0.62)
+        ctx.stroke()
+      }
     }
     Connections {
       target: root
